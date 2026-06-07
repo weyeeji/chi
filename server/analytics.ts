@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import type { Condition, ProbeDecision } from "../src/shared/experiment.js";
-import { conditions, raterDimensions, seededProbes } from "../src/shared/experiment.js";
+import type { Arm, ProbeDecision } from "../src/shared/experiment.js";
+import { raterDimensions, seededProbes, perceivedPersonalityDimensions } from "../src/shared/experiment.js";
 import { listEvents, listParticipants, listRatings, type BlindRating, type EventRecord, type ParticipantRecord } from "./storage.js";
 
 function mean(values: number[]) {
@@ -8,47 +8,38 @@ function mean(values: number[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function sd(values: number[]) {
+  if (values.length < 2) return null;
+  const m = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance = values.reduce((sum, value) => sum + (value - m) ** 2, 0) / (values.length - 1);
+  return Math.sqrt(variance);
+}
+
+// Paired-difference summary: given per-participant (specific, neutral) pairs, report the
+// mean within-participant difference, its SD, and a paired Cohen's dz effect size. This is
+// the workhorse statistic for the within-subjects design and is robust at small N.
+function pairedSummary(pairs: Array<{ specific: number; neutral: number }>) {
+  const diffs = pairs.map((pair) => pair.specific - pair.neutral);
+  if (!diffs.length) return { n: 0, meanSpecific: null, meanNeutral: null, meanDiff: null, sdDiff: null, dz: null };
+  const meanDiff = mean(diffs);
+  const sdDiff = sd(diffs);
+  return {
+    n: diffs.length,
+    meanSpecific: mean(pairs.map((pair) => pair.specific)),
+    meanNeutral: mean(pairs.map((pair) => pair.neutral)),
+    meanDiff,
+    sdDiff,
+    dz: meanDiff !== null && sdDiff && sdDiff > 0 ? Number((meanDiff / sdDiff).toFixed(3)) : null
+  };
+}
+
 function averageRecord(record: Record<string, number>) {
   return mean(Object.values(record).filter((value) => Number.isFinite(value)));
 }
 
-function blindItemId(participantId: string, stage: "initial" | "final") {
-  const salt = process.env.BLIND_ITEM_SALT ?? "role-specific-agent-personality-lab-v1";
-  return createHash("sha256").update(`${salt}:${participantId}:${stage}`).digest("base64url").slice(0, 18);
-}
-
-function expandedRatingRows(ratings: BlindRating[]) {
-  return ratings.flatMap((rating) => {
-    if (rating.stage && rating.ratings) {
-      return [{
-        itemId: rating.itemId ?? blindItemId(rating.participantId, rating.stage),
-        participantId: rating.participantId,
-        stage: rating.stage,
-        raterId: rating.raterId || "anonymous",
-        ratings: rating.ratings
-      }];
-    }
-    const legacy = [];
-    if (rating.initial) {
-      legacy.push({
-        itemId: blindItemId(rating.participantId, "initial"),
-        participantId: rating.participantId,
-        stage: "initial" as const,
-        raterId: rating.raterId || "anonymous",
-        ratings: rating.initial
-      });
-    }
-    if (rating.final) {
-      legacy.push({
-        itemId: blindItemId(rating.participantId, "final"),
-        participantId: rating.participantId,
-        stage: "final" as const,
-        raterId: rating.raterId || "anonymous",
-        ratings: rating.final
-      });
-    }
-    return legacy;
-  });
+function blindItemId(participantId: string, blockIndex: number, stage: "initial" | "final") {
+  const salt = process.env.BLIND_ITEM_SALT ?? "agent-team-personality-ab-v1";
+  return createHash("sha256").update(`${salt}:${participantId}:${blockIndex}:${stage}`).digest("base64url").slice(0, 18);
 }
 
 function orderedSquaredDistance(values: number[]) {
@@ -73,45 +64,20 @@ function krippendorffAlphaInterval(groups: number[][]) {
   return 1 - observed / expected;
 }
 
-function conditionFactors(condition: Condition) {
-  return {
-    coordinator: condition.coordinator === "specific" ? 1 : 0,
-    ideator: condition.ideator === "specific" ? 1 : 0,
-    critic: condition.critic === "specific" ? 1 : 0,
-    verifier: condition.verifier === "specific" ? 1 : 0
-  };
-}
-
-function participantSurveyScore(participant: ParticipantRecord, keys: string[]) {
-  const survey = participant.postSurvey ?? {};
-  const values = keys.map((key) => Number(survey[key])).filter((value) => Number.isFinite(value));
+// Mean blind-rated quality for one (participant, block, stage) item, averaged over raters
+// and rubric dimensions.
+function itemMeanRating(ratings: BlindRating[], participantId: string, blockIndex: number, stage: "initial" | "final") {
+  const itemId = blindItemId(participantId, blockIndex, stage);
+  const values = ratings
+    .filter((rating) => rating.itemId === itemId && rating.ratings)
+    .map((rating) => averageRecord(rating.ratings))
+    .filter((value): value is number => value !== null);
   return mean(values);
 }
 
-function ratingsByParticipant(ratings: BlindRating[]) {
-  const grouped = new Map<string, BlindRating[]>();
-  for (const rating of ratings) {
-    const list = grouped.get(rating.participantId) ?? [];
-    list.push(rating);
-    grouped.set(rating.participantId, list);
-  }
-  return grouped;
-}
-
-function ratingImprovement(ratings: BlindRating[]) {
-  const stageMean = (stage: "initial" | "final") => {
-    const values = ratings
-      .map((rating) => {
-        if (rating.stage === stage && rating.ratings) return averageRecord(rating.ratings);
-        if (stage === "initial" && rating.initial) return averageRecord(rating.initial);
-        if (stage === "final" && rating.final) return averageRecord(rating.final);
-        return null;
-      })
-      .filter((value): value is number => value !== null);
-    return mean(values);
-  };
-  const initial = stageMean("initial");
-  const final = stageMean("final");
+function blockImprovement(ratings: BlindRating[], participantId: string, blockIndex: number) {
+  const initial = itemMeanRating(ratings, participantId, blockIndex, "initial");
+  const final = itemMeanRating(ratings, participantId, blockIndex, "final");
   if (initial === null || final === null) return null;
   return final - initial;
 }
@@ -121,12 +87,14 @@ function probeDecisions(events: EventRecord[]) {
     .filter((event) => event.type === "probe_decision")
     .map((event) => ({
       participantId: event.participantId,
-      ...(event.payload as { probeId?: string; decision?: ProbeDecision })
+      ...(event.payload as { probeId?: string; decision?: ProbeDecision; blockIndex?: number })
     }))
     .filter((event) => event.probeId && event.decision);
 }
 
-function calibrationScoreForDecisions(decisions: Array<{ probeId?: string; decision?: ProbeDecision }>) {
+// Lenient calibration: valid suggestions credited when accepted or reframed; flawed
+// suggestions credited when rejected, questioned, or reframed.
+function calibrationScore(decisions: Array<{ probeId?: string; decision?: ProbeDecision }>) {
   if (!decisions.length) return null;
   let good = 0;
   for (const decision of decisions) {
@@ -138,11 +106,9 @@ function calibrationScoreForDecisions(decisions: Array<{ probeId?: string; decis
   return good / decisions.length;
 }
 
-// M1: strict calibration variant. "reframed" is lenient because a participant who
-// reframes everything scores 100% under the lenient rule. The strict rule credits
-// reframe only for flawed probes (reframing a flaw is a corrective act), and for
-// valid probes requires outright acceptance/adoption.
-function strictCalibrationScoreForDecisions(decisions: Array<{ probeId?: string; decision?: ProbeDecision }>) {
+// Strict calibration: reframe credited only for flawed suggestions; valid suggestions
+// require outright acceptance. Guards against "reframe everything" scoring as calibrated.
+function strictCalibrationScore(decisions: Array<{ probeId?: string; decision?: ProbeDecision }>) {
   if (!decisions.length) return null;
   let good = 0;
   for (const decision of decisions) {
@@ -167,130 +133,135 @@ function summarizeBy<T extends string>(values: T[]) {
 function agentMessages(events: EventRecord[]) {
   return events
     .filter((event) => event.type === "agent_message")
-    .map((event) => {
-      const payload = event.payload as {
-        message?: { role?: string; latencyMs?: number; tokenEstimate?: number; round?: number };
-        level?: "neutral" | "specific";
-        usedFallback?: boolean;
-        wordCount?: number;
-        probeDelivery?: Array<{ probeId: string; validity: string; delivered: boolean; verbatim: boolean; overlap: number }>;
-      };
-      return { ...payload, message: payload.message };
+    .map((event) => event.payload as {
+      message?: { role?: string; latencyMs?: number; tokenEstimate?: number };
+      arm?: Arm;
+      usedFallback?: boolean;
+      wordCount?: number;
+      probeDelivery?: Array<{ probeId: string; validity: string; delivered: boolean; verbatim: boolean; overlap: number }>;
     })
     .filter((row): row is {
-      message: { role: string; latencyMs?: number; tokenEstimate?: number; round?: number };
-      level?: "neutral" | "specific";
+      message: { role: string; latencyMs?: number; tokenEstimate?: number };
+      arm?: Arm;
       usedFallback?: boolean;
       wordCount?: number;
       probeDelivery?: Array<{ probeId: string; validity: string; delivered: boolean; verbatim: boolean; overlap: number }>;
     } => Boolean(row.message?.role));
 }
 
+// Per-participant, per-block survey score over a set of keys, read from the block survey.
+function blockSurveyScore(participant: ParticipantRecord, blockIndex: number, keys: string[]) {
+  const survey = participant.blocks.find((block) => block.index === blockIndex)?.blockSurvey ?? {};
+  const values = keys.map((key) => Number(survey[key])).filter((value) => Number.isFinite(value));
+  return mean(values);
+}
+
+const LOAD_KEYS = ["mentalDemand", "temporalDemand", "effort", "frustration"];
+const LEGIBILITY_KEYS = ["roleClarity", "askRightAgent", "interpretDisagreement", "styleRoleFit"];
+const PRESSURE_KEYS = ["feltPushed", "tooForceful", "overRelianceConcern"];
+const AUTONOMY_KEYS = ["ownership", "rejectWithoutPenalty"];
+const CONFLICT_KEYS = ["constructiveConflict", "critiqueUseful"];
+
 export async function buildAnalytics() {
   const [participants, events, ratings] = await Promise.all([listParticipants(), listEvents(), listRatings()]);
-  const study1 = participants.filter((participant) => participant.study === "study1");
-  const study0 = participants.filter((participant) => participant.study === "study0");
-  const study2 = participants.filter((participant) => participant.study === "study2");
-  const ratingMap = ratingsByParticipant(ratings);
-  const ratingRows = expandedRatingRows(ratings);
   const decisions = probeDecisions(events);
   const agentMessageRows = agentMessages(events);
 
-  const conditionSummary = conditions.map((condition) => {
-    const group = study1.filter((participant) => participant.conditionId === condition.id);
-    const groupRatings = group.flatMap((participant) => ratingMap.get(participant.id) ?? []);
-    const probeEvents = decisions.filter((event) => group.some((participant) => participant.id === event.participantId));
-    const flawed = probeEvents.filter((event) => seededProbes.find((probe) => probe.id === event.probeId)?.validity === "flawed");
-    const valid = probeEvents.filter((event) => seededProbes.find((probe) => probe.id === event.probeId)?.validity === "valid");
-    const flawedGood = flawed.filter((event) => event.decision === "rejected" || event.decision === "questioned" || event.decision === "reframed").length;
-    const validGood = valid.filter((event) => event.decision === "accepted" || event.decision === "reframed").length;
+  // For each participant, build the per-arm metric pair (specific block vs neutral block).
+  const participantPairs = participants.map((participant) => {
+    const armBlock = (arm: Arm) => participant.blocks.find((block) => block.arm === arm);
+    const specificBlock = armBlock("specific");
+    const neutralBlock = armBlock("neutral");
+
+    const metricsForBlock = (blockIndex?: number) => {
+      if (blockIndex === undefined) return null;
+      const decisionsHere = decisions.filter((d) => d.participantId === participant.id && d.blockIndex === blockIndex);
+      return {
+        improvement: blockImprovement(ratings, participant.id, blockIndex),
+        finalQuality: itemMeanRating(ratings, participant.id, blockIndex, "final"),
+        cognitiveLoad: blockSurveyScore(participant, blockIndex, LOAD_KEYS),
+        roleLegibility: blockSurveyScore(participant, blockIndex, LEGIBILITY_KEYS),
+        pressure: blockSurveyScore(participant, blockIndex, PRESSURE_KEYS),
+        autonomy: blockSurveyScore(participant, blockIndex, AUTONOMY_KEYS),
+        constructiveConflict: blockSurveyScore(participant, blockIndex, CONFLICT_KEYS),
+        calibration: calibrationScore(decisionsHere),
+        strictCalibration: strictCalibrationScore(decisionsHere)
+      };
+    };
+
     return {
-      conditionId: condition.id,
-      n: group.length,
-      completed: group.filter((participant) => participant.completedAt).length,
-      improvement: ratingImprovement(groupRatings),
-      cognitiveLoad: mean(group.map((participant) => participantSurveyScore(participant, ["mentalDemand", "temporalDemand", "effort", "frustration"]) ?? NaN).filter((value) => Number.isFinite(value))),
-      roleLegibility: mean(group.map((participant) => participantSurveyScore(participant, ["roleClarity", "askRightAgent", "interpretDisagreement", "styleRoleFit"]) ?? NaN).filter((value) => Number.isFinite(value))),
-      pressure: mean(group.map((participant) => participantSurveyScore(participant, ["feltPushed", "tooForceful", "overRelianceConcern"]) ?? NaN).filter((value) => Number.isFinite(value))),
-      autonomy: mean(group.map((participant) => Number(participant.postSurvey?.ownership)).filter((value) => Number.isFinite(value))),
-      calibration: probeEvents.length ? (flawedGood + validGood) / probeEvents.length : null
+      participantId: participant.id,
+      sequenceId: participant.sequenceId,
+      completed: Boolean(participant.completedAt),
+      specific: metricsForBlock(specificBlock?.index),
+      neutral: metricsForBlock(neutralBlock?.index)
     };
   });
 
-  const participantMetrics = study1.map((participant) => ({
-    participantId: participant.id,
-    conditionId: participant.conditionId,
-    factors: participant.condition ? conditionFactors(participant.condition) : null,
-    improvement: ratingImprovement(ratingMap.get(participant.id) ?? []),
-    cognitiveLoad: participantSurveyScore(participant, ["mentalDemand", "temporalDemand", "effort", "frustration"]),
-    roleLegibility: participantSurveyScore(participant, ["roleClarity", "askRightAgent", "interpretDisagreement", "styleRoleFit"]),
-    pressure: participantSurveyScore(participant, ["feltPushed", "tooForceful", "overRelianceConcern"]),
-    autonomy: Number(participant.postSurvey?.ownership) || null,
-    calibration: calibrationScoreForDecisions(decisions.filter((event) => event.participantId === participant.id)),
-    strictCalibration: strictCalibrationScoreForDecisions(decisions.filter((event) => event.participantId === participant.id))
-  }));
-
-  const roleMainEffects = ["coordinator", "ideator", "critic", "verifier"].map((role) => {
-    const high = participantMetrics.filter((metric) => metric.factors?.[role as keyof ReturnType<typeof conditionFactors>] === 1);
-    const low = participantMetrics.filter((metric) => metric.factors?.[role as keyof ReturnType<typeof conditionFactors>] === 0);
-    const highImprovement = mean(high.map((metric) => metric.improvement ?? NaN).filter((value) => Number.isFinite(value)));
-    const lowImprovement = mean(low.map((metric) => metric.improvement ?? NaN).filter((value) => Number.isFinite(value)));
-    return {
-      role,
-      nHigh: high.length,
-      nLow: low.length,
-      improvementHigh: highImprovement,
-      improvementLow: lowImprovement,
-      improvementDiff: highImprovement !== null && lowImprovement !== null ? highImprovement - lowImprovement : null,
-      matchedOutcome: role === "coordinator"
-        ? {
-          high: mean(high.map((metric) => metric.cognitiveLoad ?? NaN).filter((value) => Number.isFinite(value))),
-          low: mean(low.map((metric) => metric.cognitiveLoad ?? NaN).filter((value) => Number.isFinite(value))),
-          label: "Cognitive load, lower is better"
-        }
-        : role === "ideator"
-          ? { high: highImprovement, low: lowImprovement, label: "Blind-rated improvement" }
-          : role === "critic"
-            ? {
-              high: mean(high.map((metric) => metric.pressure ?? NaN).filter((value) => Number.isFinite(value))),
-              low: mean(low.map((metric) => metric.pressure ?? NaN).filter((value) => Number.isFinite(value))),
-              label: "Perceived pressure"
-            }
-            : {
-              high: mean(high.map((metric) => metric.calibration ?? NaN).filter((value) => Number.isFinite(value))),
-              low: mean(low.map((metric) => metric.calibration ?? NaN).filter((value) => Number.isFinite(value))),
-              label: "Calibration score"
-            }
-    };
+  // Paired contrasts for every primary and secondary outcome.
+  const metricKeys = [
+    "improvement",
+    "finalQuality",
+    "calibration",
+    "strictCalibration",
+    "cognitiveLoad",
+    "roleLegibility",
+    "pressure",
+    "autonomy",
+    "constructiveConflict"
+  ] as const;
+  const pairedContrasts = metricKeys.map((key) => {
+    const pairs = participantPairs
+      .map((pair) => {
+        const specific = pair.specific?.[key];
+        const neutral = pair.neutral?.[key];
+        if (specific === null || specific === undefined || neutral === null || neutral === undefined) return null;
+        return { specific, neutral };
+      })
+      .filter((pair): pair is { specific: number; neutral: number } => pair !== null);
+    return { key, ...pairedSummary(pairs) };
   });
 
-  const manipulationCheck = study0.flatMap((participant) => {
-    const ratings = Array.isArray(participant.study0Ratings) ? participant.study0Ratings : [];
-    return ratings.map((rating) => ({ participantId: participant.id, ...rating as Record<string, unknown> }));
+  // In-context perceived-personality manipulation check, paired by participant.
+  const perceivedChecks = perceivedPersonalityDimensions.map((dimension) => {
+    const pairs = participants
+      .map((participant) => {
+        const specific = blockSurveyScore(participant, participant.blocks.find((b) => b.arm === "specific")?.index ?? -1, [dimension.key]);
+        const neutral = blockSurveyScore(participant, participant.blocks.find((b) => b.arm === "neutral")?.index ?? -1, [dimension.key]);
+        if (specific === null || neutral === null) return null;
+        return { specific, neutral };
+      })
+      .filter((pair): pair is { specific: number; neutral: number } => pair !== null);
+    return { key: dimension.key, label: dimension.labelEn, ...pairedSummary(pairs) };
   });
 
+  // Probe decision distribution, split by arm so reviewers can see whether calibrated
+  // handling differs between neutral and specific blocks.
   const probeSummary = seededProbes.map((probe) => {
     const related = decisions.filter((event) => event.probeId === probe.id);
+    const countDecision = (rows: typeof related, decision: ProbeDecision) =>
+      rows.filter((event) => event.decision === decision).length;
     return {
       probeId: probe.id,
       title: probe.title,
+      topicId: probe.topicId,
       validity: probe.validity,
+      sourceRole: probe.sourceRole,
       n: related.length,
-      accepted: related.filter((event) => event.decision === "accepted").length,
-      rejected: related.filter((event) => event.decision === "rejected").length,
-      questioned: related.filter((event) => event.decision === "questioned").length,
-      reframed: related.filter((event) => event.decision === "reframed").length
+      accepted: countDecision(related, "accepted"),
+      rejected: countDecision(related, "rejected"),
+      questioned: countDecision(related, "questioned"),
+      reframed: countDecision(related, "reframed")
     };
   });
 
   const completionFunnel = [
-    { stage: "created", count: study1.length },
-    { stage: "pre_survey", count: study1.filter((participant) => participant.preSurvey).length },
-    { stage: "initial_proposal", count: study1.filter((participant) => participant.initialProposal).length },
-    { stage: "workspace_completed", count: study1.filter((participant) => participant.status === "workspace_completed" || participant.finalProposal || participant.completedAt).length },
-    { stage: "final_proposal", count: study1.filter((participant) => participant.finalProposal).length },
-    { stage: "post_survey", count: study1.filter((participant) => participant.postSurvey).length },
-    { stage: "completed", count: study1.filter((participant) => participant.completedAt).length }
+    { stage: "created", count: participants.length },
+    { stage: "pre_survey", count: participants.filter((p) => p.preSurvey).length },
+    { stage: "block1_final", count: participants.filter((p) => p.blocks.find((b) => b.index === 1)?.finalProposal).length },
+    { stage: "block2_final", count: participants.filter((p) => p.blocks.find((b) => b.index === 2)?.finalProposal).length },
+    { stage: "final_survey", count: participants.filter((p) => p.finalSurvey).length },
+    { stage: "completed", count: participants.filter((p) => p.completedAt).length }
   ];
 
   const eventTypeSummary = summarizeBy(events.map((event) => event.type));
@@ -305,13 +276,12 @@ export async function buildAnalytics() {
     };
   });
 
-  // M2: capability/verbosity parity check. If "specific" turns are systematically
-  // longer than "neutral" turns for a role, response length confounds the personality
-  // manipulation. Pre-register a parity criterion and, if violated, covary out length.
-  const responseLengthByLevel = ["coordinator", "ideator", "critic", "verifier"].map((role) => {
+  // Capability/verbosity parity check, by role and arm. If specific turns are
+  // systematically longer than neutral turns, length confounds the manipulation.
+  const responseLengthByArm = ["coordinator", "ideator", "critic", "verifier"].map((role) => {
     const group = agentMessageRows.filter((row) => row.message.role === role && Number.isFinite(Number(row.wordCount)));
-    const neutral = group.filter((row) => row.level === "neutral").map((row) => Number(row.wordCount));
-    const specific = group.filter((row) => row.level === "specific").map((row) => Number(row.wordCount));
+    const neutral = group.filter((row) => row.arm === "neutral").map((row) => Number(row.wordCount));
+    const specific = group.filter((row) => row.arm === "specific").map((row) => Number(row.wordCount));
     const neutralMean = mean(neutral);
     const specificMean = mean(specific);
     return {
@@ -324,9 +294,7 @@ export async function buildAnalytics() {
     };
   });
 
-  // C3: probe-delivery monitor. The calibrated-reliance contribution assumes each
-  // seeded suggestion reaches the participant verbatim. Report delivery rate per probe
-  // and an agent fallback count so contaminated turns can be flagged or excluded.
+  // Probe-delivery monitor: each seeded suggestion should reach the participant verbatim.
   const probeDeliveryRows = agentMessageRows.flatMap((row) => row.probeDelivery ?? []);
   const probeDeliverySummary = seededProbes.map((probe) => {
     const related = probeDeliveryRows.filter((row) => row.probeId === probe.id);
@@ -342,9 +310,9 @@ export async function buildAnalytics() {
       meanOverlap: mean(related.map((row) => Number(row.overlap)).filter((value) => Number.isFinite(value)))
     };
   });
-  const fallbackByLevel = {
-    neutral: agentMessageRows.filter((row) => row.usedFallback && row.level === "neutral").length,
-    specific: agentMessageRows.filter((row) => row.usedFallback && row.level === "specific").length
+  const fallbackByArm = {
+    neutral: agentMessageRows.filter((row) => row.usedFallback && row.arm === "neutral").length,
+    specific: agentMessageRows.filter((row) => row.usedFallback && row.arm === "specific").length
   };
 
   const directedTurnSummary = summarizeBy(
@@ -353,34 +321,37 @@ export async function buildAnalytics() {
       .map((event) => String((event.payload as { targetRole?: string }).targetRole ?? "unknown"))
   );
 
-  const expectedRatingItems = study1
-    .filter((participant) => participant.initialProposal && participant.finalProposal)
-    .flatMap((participant) => (["initial", "final"] as const).map((stage) => ({
-      itemId: blindItemId(participant.id, stage),
-      displayId: `item-${blindItemId(participant.id, stage).slice(0, 10)}`,
-      participantId: participant.id,
-      stage
-    })));
+  // Blind-rating coverage and reliability over all expected items (4 per completed-ish
+  // participant: 2 blocks x initial/final).
+  const expectedRatingItems = participants
+    .flatMap((participant) =>
+      participant.blocks.flatMap((block) => {
+        if (!block.initialProposal || !block.finalProposal) return [];
+        return (["initial", "final"] as const).map((stage) => ({
+          itemId: blindItemId(participant.id, block.index, stage),
+          displayId: `item-${blindItemId(participant.id, block.index, stage).slice(0, 10)}`,
+          participantId: participant.id,
+          blockIndex: block.index,
+          stage
+        }));
+      })
+    );
   const itemRaterSets = new Map<string, Set<string>>();
-  for (const row of ratingRows) {
-    const set = itemRaterSets.get(row.itemId) ?? new Set<string>();
-    set.add(row.raterId.trim().toLowerCase());
-    itemRaterSets.set(row.itemId, set);
+  for (const rating of ratings) {
+    const set = itemRaterSets.get(rating.itemId) ?? new Set<string>();
+    set.add((rating.raterId || "anonymous").trim().toLowerCase());
+    itemRaterSets.set(rating.itemId, set);
   }
   const ratingCoverage = expectedRatingItems.map((item) => {
     const ratedCount = itemRaterSets.get(item.itemId)?.size ?? 0;
-    return {
-      ...item,
-      ratedCount,
-      neededRatings: Math.max(0, 3 - ratedCount)
-    };
+    return { ...item, ratedCount, neededRatings: Math.max(0, 3 - ratedCount) };
   });
 
   const ratingReliability = raterDimensions.map((dimension) => {
     const groups = expectedRatingItems.map((item) =>
-      ratingRows
-        .filter((row) => row.itemId === item.itemId)
-        .map((row) => Number(row.ratings[dimension.key]))
+      ratings
+        .filter((rating) => rating.itemId === item.itemId && rating.ratings)
+        .map((rating) => Number(rating.ratings[dimension.key]))
         .filter((value) => Number.isFinite(value))
     );
     return {
@@ -391,51 +362,40 @@ export async function buildAnalytics() {
     };
   });
 
-  const raterSummary = Array.from(ratingRows.reduce((map, row) => {
-    const key = row.raterId || "anonymous";
+  const raterSummary = Array.from(ratings.reduce((map, rating) => {
+    const key = rating.raterId || "anonymous";
     map.set(key, (map.get(key) ?? 0) + 1);
     return map;
   }, new Map<string, number>()).entries())
     .map(([raterId, count]) => ({ raterId, count }))
     .sort((a, b) => b.count - a.count || a.raterId.localeCompare(b.raterId));
 
-  const constructSummary = [
-    { key: "cognitiveLoad", label: "Cognitive load", mean: mean(participantMetrics.map((metric) => metric.cognitiveLoad ?? NaN).filter((value) => Number.isFinite(value))) },
-    { key: "roleLegibility", label: "Role legibility", mean: mean(participantMetrics.map((metric) => metric.roleLegibility ?? NaN).filter((value) => Number.isFinite(value))) },
-    { key: "pressure", label: "Perceived pressure", mean: mean(participantMetrics.map((metric) => metric.pressure ?? NaN).filter((value) => Number.isFinite(value))) },
-    { key: "autonomy", label: "User autonomy", mean: mean(participantMetrics.map((metric) => metric.autonomy ?? NaN).filter((value) => Number.isFinite(value))) },
-    { key: "calibration", label: "Behavioral calibration (lenient)", mean: mean(participantMetrics.map((metric) => metric.calibration ?? NaN).filter((value) => Number.isFinite(value))) },
-    { key: "strictCalibration", label: "Behavioral calibration (strict)", mean: mean(participantMetrics.map((metric) => metric.strictCalibration ?? NaN).filter((value) => Number.isFinite(value))) }
-  ];
+  const sequenceBalance = summarizeBy(participants.map((p) => p.sequenceId));
 
   return {
     generatedAt: new Date().toISOString(),
     counts: {
       participants: participants.length,
-      study0: study0.length,
-      study1: study1.length,
-      study2: study2.length,
-      completedStudy1: study1.filter((participant) => participant.completedAt).length,
+      completed: participants.filter((p) => p.completedAt).length,
       ratings: ratings.length,
       fullyRatedBlindItems: ratingCoverage.filter((item) => item.ratedCount >= 3).length,
       expectedBlindItems: ratingCoverage.length,
       events: events.length
     },
-    conditionSummary,
-    roleMainEffects,
+    pairedContrasts,
+    perceivedChecks,
     probeSummary,
     probeDeliverySummary,
-    fallbackByLevel,
-    responseLengthByLevel,
+    fallbackByArm,
+    responseLengthByArm,
     completionFunnel,
+    sequenceBalance,
     eventTypeSummary,
     agentRoleSummary,
     directedTurnSummary,
-    constructSummary,
     ratingCoverage,
     ratingReliability,
     raterSummary,
-    manipulationCheck,
-    participantMetrics
+    participantPairs
   };
 }

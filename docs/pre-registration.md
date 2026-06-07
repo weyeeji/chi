@@ -1,195 +1,121 @@
-# Study 1 Pre-Registration Draft
+# Pre-Registration Draft
 
 ## Study Title
 
-Role-Specific Agent Personality in Human-Agent Team Collaboration
+Role-Specific Agent Personality in Human-Agent Team Collaboration: A Within-Subjects Study
 
-## Primary Research Question
+## Research Questions
 
-Which role-specific agent personality expressions improve human-agent team collaboration, and through which role-matched outcomes?
+- **RQ1 (Output & reliance).** Compared with a neutral-personality agent team, does a role-specific-personality team improve the human collaborator's task output quality and calibrated reliance on seeded suggestions?
+- **RQ2 (Experience & cost).** How does role-specific personality affect the collaboration experience — role legibility, cognitive load, constructive conflict, perceived pressure, and user autonomy — and what trade-offs does it introduce?
 
 ## Design
 
-Study 1 uses an L8 fractional factorial ablation design with four binary factors:
+A within-subjects (repeated-measures) A/B design. Each participant completes **two collaboration blocks** with the same four-role team (Coordinator, Ideator, Critic, Verifier):
 
-- Coordinator: neutral vs structured facilitator
-- Ideator: neutral vs exploratory creator
-- Critic: neutral vs constructive skeptic
-- Verifier: neutral vs calibrated verifier
+- one block with a **neutral** personality expression for every agent;
+- one block with a **role-specific** personality expression for every agent.
 
-The eight conditions estimate main effects. Two-way interactions are exploratory because the L8 design aliases interaction terms.
+The two blocks use two matched design briefs (Topic A: student AI literacy; Topic B: workplace AI advice). Arm order and the arm-to-topic mapping are counterbalanced over four sequences (S1–S4), assigned round-robin by intake order.
+
+In both arms the agents' functional role, expertise, count, orchestration, turn order, model, token budget, and UI are identical. The only systematic change is whether each role uses its role-specific personality expression.
 
 ## Construct and Estimand
 
-The manipulation varies the **expression strength of a role-congruent behavioral style**, not the presence versus absence of a functional role. In every condition all four agents retain their functional role instruction (the Critic still critiques, the Verifier still checks). The "neutral" level expresses that role in a flat, un-amplified voice; the "specific" level amplifies the role-congruent behavioral stance and linguistic style.
+The manipulation varies the **expression strength of a role-congruent behavioral style**, not the presence versus absence of a functional role. In both arms all four agents retain their role instruction (the Critic still critiques, the Verifier still checks). The neutral arm expresses each role in a flat, distinguishable-but-un-amplified voice; the specific arm amplifies the role-congruent behavioral stance and linguistic style.
 
-The causal estimand for each factor is therefore the marginal effect of amplified role-congruent personality expression, holding functional role, expertise, turn order, model, and token budget constant. We do not claim that role and personality are fully orthogonal; we claim that personality expression strength is manipulable independently of which role an agent performs.
-
-## Power Analysis
-
-The confirmatory tests are the four personality-by-stage interaction terms in the item-level mixed model. Power is determined by simulation rather than asserted.
-
-- Smallest effect size of interest (SESOI): a personality-by-stage interaction equal to 0.30 SD on the 1-7 blind-rating scale (a one-third standard-deviation shift in initial-to-final improvement attributable to a single role's personality).
-- Assumptions to be fixed before data collection: 3 ratings per item, rater random-effect ICC in the 0.5-0.7 range, participant random intercept, residual SD estimated from Study 0 pilot ratings.
-- Procedure: simulate the full mixed model 1,000 times at candidate sample sizes (320, 400, 480) under the L8 assignment, recover each of the four personality-by-stage terms, and report power as the proportion of simulations with a significant term at the Bonferroni-adjusted alpha for four primary tests.
-- Decision rule: select the smallest N achieving at least 0.80 power for all four primary terms at the SESOI. The target of 400 valid participants (50 per condition) is provisional and will be confirmed or revised by this simulation before recruitment.
-- The simulation script is included in the supplement.
+The causal estimand is the **within-participant marginal effect of amplified role-congruent personality expression**, holding functional role, expertise, turn order, model, and token budget constant. We do not claim that role and personality are fully orthogonal; we claim that personality expression strength is manipulable independently of which role an agent performs. Because each participant is their own control, between-person variation in skill, motivation, and AI familiarity is differenced out.
 
 ## Target Sample
 
-Target valid sample: 400 participants, 50 per condition.
+Target valid sample: **16–20 participants** (each contributing one neutral and one specific block). With paired observations and an anticipated medium-to-large within-person effect on the primary outcomes, this sample supports interpretable paired effect-size estimates. We report effect sizes with bootstrap confidence intervals rather than relying on a single significance threshold, in line with CHI guidance on small-sample reporting.
 
-Minimum acceptable valid sample for submission: 320 participants, 40 per condition.
-
-Recruitment should continue until valid-sample quotas, not only created-session quotas, are balanced across conditions.
+Counterbalance balance target: each of the four sequences assigned to at least four participants where possible.
 
 ## Valid Sample Criteria
 
 A participant is valid if all criteria are met:
 
 - consent accepted;
-- pre-survey submitted;
-- attention check passed by selecting exactly 5 on the instructed item;
-- initial proposal submitted and passed the minimum content gate: all seven fields contain at least 18 characters, with at least 320 total characters;
-- all four collaboration rounds completed;
-- all revealed seeded suggestions handled with accept, reject, question, or reframe;
-- final proposal submitted and passed the minimum content gate: all seven fields contain at least 18 characters, with at least 560 total characters;
-- post-survey submitted;
-- no technical failure invalidates the agent condition assignment;
-- no agent turn used a condition-incongruent fallback. The system logs `usedFallback` and `level` per turn; any fallback in a neutral cell that could inject specific-voiced text invalidates the session for confirmatory analysis.
+- pre-survey submitted; attention check passed (selected exactly 5 on the instructed item);
+- **both** blocks: initial proposal submitted and passing the content gate (every field ≥ 18 characters, ≥ 280 total characters);
+- **both** blocks: all revealed seeded suggestions handled (accept / reject / question / reframe);
+- **both** blocks: final proposal submitted and passing the content gate (every field ≥ 18 characters, ≥ 480 total characters);
+- both block surveys and the final comparison survey submitted;
+- no condition-incongruent fallback: any API fallback in a neutral block that could inject specific-voiced text invalidates that participant for confirmatory analysis (the system logs `usedFallback` and `arm` per turn).
 
 ## Exclusion Criteria
 
 Exclude before outcome analysis:
 
 - failed attention check;
-- duplicate participant code, keeping the first complete valid session unless a documented technical failure occurred;
-- initial or final proposal that is nonsensical, copied from instructions, or not in the task domain;
-- completion time below one third of the intended minimum duration;
-- missing agent logs for one or more system-orchestrated rounds;
-- agent API fallback in more than one role turn, unless the analysis is explicitly marked as a robustness check;
-- seeded-suggestion delivery failure: the system verifies (verbatim or high lexical overlap) that each seeded suggestion was actually emitted by its source agent. Participants for whom a probe was not faithfully delivered are excluded from the calibrated-reliance analysis for that probe, and delivery rate is reported per probe and per condition as a manipulation check.
+- a proposal that is nonsensical, copied from instructions, or off-domain;
+- completion time below one third of the intended minimum;
+- missing agent logs for one or more orchestrated rounds in either block;
+- seeded-suggestion delivery failure: the system verifies (verbatim or high lexical overlap) that each seeded suggestion was emitted by its source agent. A probe not faithfully delivered is excluded from that participant's calibrated-reliance analysis for that probe; delivery rate is reported per probe and per arm.
 
-All exclusions will be reported with counts by condition.
+All exclusions are reported with counts by sequence.
 
-## Primary Outcome
+## Primary Outcomes
 
-Blind-rated proposal improvement.
+1. **Blind-rated proposal improvement** (per block): final-minus-initial mean rubric score. Initial and final proposals are rated as anonymous single items; raters never see the arm, the topic-arm mapping, the participant id, or whether an item is initial or final. Each item receives at least three independent ratings. Rubric dimensions: problem framing, novelty, feasibility, risk awareness, user agency, evaluation rigor, overall CHI potential. Report inter-rater reliability (Krippendorff's α).
+2. **Calibrated reliance** (per block): proportion of seeded suggestions handled in line with their true validity.
 
-Initial and final proposals are rated as anonymous single items. Raters do not see condition id, participant id, or whether an item is initial or final. The rater client receives only an opaque item id; participant id and stage are resolved server-side after submission. The primary improvement score is final minus initial at the participant level after aggregating rater scores.
+## Primary Tests
 
-Rating dimensions:
+Per-participant paired contrasts (specific block minus neutral block):
 
-- problem framing
-- novelty
-- feasibility
-- risk awareness
-- user agency
-- evaluation rigor
-- overall CHI potential
+1. proposal improvement;
+2. calibrated reliance (strict scoring);
+3. role legibility;
+4. perceived pressure.
 
-Each item should receive at least three independent ratings. Report inter-rater reliability using ICC or Krippendorff's alpha. Items below the three-rater threshold are retained for monitoring but excluded from confirmatory participant-level improvement analyses unless otherwise stated as sensitivity analysis.
+For each, report the mean paired difference, paired Cohen's dz, a bootstrap 95% CI, and a Wilcoxon signed-rank test (preferred at small N; paired t as a sensitivity check).
 
-## Primary Model
+## Calibrated Reliance Scoring
 
-Item-level mixed model:
+Each topic carries four matched seeded suggestions (two valid, two flawed) embedded in source-role agent turns during rounds 2–3. The decision board records participant handling.
 
-```text
-Rating ~ Stage
-       + CoordinatorPersonality * Stage
-       + IdeatorPersonality * Stage
-       + CriticPersonality * Stage
-       + VerifierPersonality * Stage
-       + Topic
-       + AI_Familiarity
-       + Domain_Familiarity
-       + CreativeSelfEfficacy
-       + (1 | Participant)
-       + (1 | Rater)
-```
+- **Lenient (sensitivity):** valid = accepted or reframed; flawed = rejected, questioned, or reframed.
+- **Strict (confirmatory):** flawed = rejected, questioned, or reframed; valid requires outright acceptance. Guards against "reframe everything" scoring as perfectly calibrated.
 
-The primary tests are the four personality-by-stage terms. These estimate whether a role-specific personality changes improvement from initial to final proposal.
+Flawed suggestions are sourced from roles **not** charged with catching that flaw (the privacy flaw from the Ideator, the weak-evaluation flaw from the Coordinator), so probe visibility does not vary with the personality manipulation. The two topics use a one-to-one matched probe set so calibration scores are comparable across blocks.
 
-Participant-level robustness model:
+## Secondary Outcomes (paired contrasts)
 
-```text
-Improvement ~ CoordinatorPersonality
-            + IdeatorPersonality
-            + CriticPersonality
-            + VerifierPersonality
-            + InitialQuality
-            + Topic
-            + AI_Familiarity
-            + Domain_Familiarity
-            + CreativeSelfEfficacy
-```
-
-## Role-Matched Secondary Outcomes
-
-Coordinator:
-
-- cognitive load;
-- time to workspace completion;
-- unresolved branch count from behavioral coding;
-- role-targeted coordination questions.
-
-Ideator:
-
-- distinct concept count;
-- blind-rated novelty;
-- conceptual flexibility from behavioral coding.
-
-Critic:
-
-- critical depth;
-- revision depth;
+- cognitive load (NASA-TLX short);
+- role legibility;
 - constructive conflict;
-- perceived pressure.
+- perceived pressure;
+- user autonomy (ownership, reject-without-penalty);
+- in-context perceived-personality items (manipulation check: the specific arm should read as more structured / exploratory / skeptical / calibrated).
 
-Verifier:
+## Robustness and Confound Checks
 
-- calibrated reliance score;
-- evidence seeking;
-- risk awareness;
-- evaluation rigor.
-
-## Calibrated Reliance
-
-Seeded suggestions are embedded in source-role agent turns during rounds 2-4. The decision board records participant handling.
-
-Valid suggestions count as calibrated when accepted or reframed. Flawed suggestions count as calibrated when rejected, questioned, or reframed. This is the lenient scoring rule.
-
-A strict scoring rule is also pre-registered to guard against a participant who reframes everything scoring as perfectly calibrated: under the strict rule, reframe counts as calibrated only for flawed suggestions, and valid suggestions require outright acceptance. Both lenient and strict calibration are reported; the strict variant is the confirmatory measure and the lenient variant is a sensitivity analysis.
-
-Flawed suggestions are sourced from roles not charged with catching that specific flaw (for example, the privacy flaw is not sourced from the Verifier and the autonomy flaw is not sourced from the Critic) so that probe visibility does not vary with the personality factor being estimated.
-
-Report probe-level distributions as well as aggregate calibration score.
-
-## Capability Parity and Confound Checks
-
-The following are pre-registered confound checks, not outcomes:
-
-- Response length: mean agent response length (words) is compared between neutral and specific levels within each role. A pre-registered parity band is +/- 15% of the neutral mean. If a role violates the band, response length is entered as a covariate in that role's models and the violation is reported.
-- Latency and token estimates are monitored per role and level.
-- Turn order is fixed (Coordinator, Ideator, Critic, Verifier) in every condition and round. All effects are estimated under this fixed, ecologically-motivated order; serial position is confounded with role and this is stated as a scope condition, not corrected by the design.
-- Rater stage-blinding: raters answer a stage-guess item per item; guess accuracy above chance is reported and, if substantial, length-adjusted improvement is reported as a robustness analysis.
+- **Mixed model (exploratory):** `Rating ~ Stage * Arm + Topic + (1|Participant) + (1|Rater)` to confirm the paired contrast is robust to topic and rater variation.
+- **Order effect:** block order entered as a covariate to check for practice/fatigue.
+- **Response-length parity:** mean agent response length (words) compared between arms within each role; pre-registered band ±15% of the neutral mean. If violated, length is entered as a covariate.
+- **Manipulation check:** the specific arm must score higher than the neutral arm on the matched in-context personality items (paired difference > 0); otherwise the manipulation is treated as ineffective.
+- **Fallback audit:** `fallbackByArm` reported; any specific-voiced fallback in a neutral block invalidates that session for confirmatory analysis.
+- **Rater stage-blinding:** the final proposal is longer than the initial; we report a length-adjusted improvement as a robustness analysis.
 
 ## Multiple Testing
 
-Primary tests are limited to the four personality-by-stage terms. Secondary outcomes are interpreted as role-matched support. Exploratory interactions are reported separately and labelled exploratory.
+Four primary tests; report with confidence intervals and standardized effect sizes. Secondary outcomes are interpreted as supporting evidence. Any interaction or moderator analysis is exploratory and labelled as such.
 
-Use confidence intervals and standardized effect sizes for all main claims.
+## Ethics
+
+The study deliberately seeds flawed suggestions (default collection of private data; satisfaction/confidence-only evaluation) without prior disclosure, because forewarning would make calibrated reliance unmeasurable. A **mandatory debrief** reveals which suggestions were seeded flawed and why, with a do-not-implement note. No real names, grades, or sensitive identity data are collected.
 
 ## Transparency Materials
 
 The anonymized supplement should include:
 
-- prompt/personality configuration;
-- Study 0 material pool;
-- Study 1 survey text;
-- L8 assignment matrix;
-- seeded suggestion list;
+- prompt/personality configuration (`server/agent-personalities.json`);
+- the two topics and the matched seeded-suggestion list (`src/shared/experiment.ts`);
+- survey text (pre-survey, block survey, final comparison survey);
+- counterbalance sequence table;
 - behavioral codebook;
-- blind rating rubric;
-- analysis code, including the Study 1 quality audit script for sample gates, blind-rating coverage, duplicate ratings, and reliability;
+- blind-rating rubric;
+- analysis code, including the quality-audit script (sample gates, coverage, duplicate ratings, reliability, paired contrasts);
 - de-identified aggregate data or a synthetic dataset if raw text cannot be shared.

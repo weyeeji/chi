@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Audit Study 1 recruitment, blind-rating coverage, and reliability.
+"""Audit recruitment, blind-rating coverage, reliability, and paired contrasts
+for the within-subjects agent-team personality study.
 
-The script intentionally uses only the Python standard library so it can run on
-the study server without extra setup. It reads local JSON records from data/.
+The script uses only the Python standard library so it can run on the study
+server without extra setup. It reads local JSON records from data/.
+
+Data model (see src/shared/experiment.ts and server/storage.ts):
+- Each participant has two blocks; each block has an arm ("neutral" | "specific"),
+  a topicId, an initialProposal, a finalProposal, and a blockSurvey.
+- Blind ratings target an opaque item id keyed by (participant, blockIndex, stage).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
 import os
 from pathlib import Path
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any
 
 
@@ -27,17 +34,12 @@ RATER_DIMENSIONS = [
     "overallChiPotential",
 ]
 
-PROPOSAL_FIELDS = [
-    "problem",
-    "users",
-    "concept",
-    "flow",
-    "risks",
-    "evaluation",
-    "agency",
-]
+PROPOSAL_FIELDS = ["problem", "users", "concept", "flow", "risks", "evaluation", "agency"]
 
-CONDITIONS = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"]
+SEQUENCES = ["S1", "S2", "S3", "S4"]
+
+MIN_INITIAL_CHARS = 280
+MIN_FINAL_CHARS = 480
 
 
 def load_json_dir(directory: Path) -> list[dict[str, Any]]:
@@ -61,44 +63,10 @@ def proposal_issues(proposal: Any, min_chars: int) -> list[str]:
     return issues
 
 
-def blind_item_id(participant_id: str, stage: str) -> str:
-    salt = os.environ.get("BLIND_ITEM_SALT", "role-specific-agent-personality-lab-v1")
-    digest = hashlib.sha256(f"{salt}:{participant_id}:{stage}".encode("utf-8")).digest()
-    import base64
-
+def blind_item_id(participant_id: str, block_index: int, stage: str) -> str:
+    salt = os.environ.get("BLIND_ITEM_SALT", "agent-team-personality-ab-v1")
+    digest = hashlib.sha256(f"{salt}:{participant_id}:{block_index}:{stage}".encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:18]
-
-
-def expand_ratings(ratings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for rating in ratings:
-        participant_id = str(rating.get("participantId", ""))
-        rater_id = str(rating.get("raterId") or "anonymous").strip().lower()
-        stage = rating.get("stage")
-        if stage in {"initial", "final"} and isinstance(rating.get("ratings"), dict):
-            rows.append(
-                {
-                    "itemId": rating.get("itemId") or blind_item_id(participant_id, stage),
-                    "participantId": participant_id,
-                    "stage": stage,
-                    "raterId": rater_id,
-                    "ratings": rating["ratings"],
-                }
-            )
-            continue
-        for legacy_stage in ("initial", "final"):
-            legacy_scores = rating.get(legacy_stage)
-            if isinstance(legacy_scores, dict):
-                rows.append(
-                    {
-                        "itemId": blind_item_id(participant_id, legacy_stage),
-                        "participantId": participant_id,
-                        "stage": legacy_stage,
-                        "raterId": rater_id,
-                        "ratings": legacy_scores,
-                    }
-                )
-    return rows
 
 
 def ordered_squared_distance(values: list[float]) -> float:
@@ -122,6 +90,51 @@ def score_mean(scores: dict[str, Any]) -> float | None:
     return mean(values) if values else None
 
 
+def paired_summary(pairs: list[tuple[float, float]]) -> dict[str, Any]:
+    """pairs: list of (specific, neutral). Returns mean difference and Cohen's dz."""
+    diffs = [specific - neutral for specific, neutral in pairs]
+    if not diffs:
+        return {"n": 0, "meanDiff": None, "dz": None}
+    md = mean(diffs)
+    # Sample SD of the differences.
+    sd = pstdev(diffs) * (len(diffs) / (len(diffs) - 1)) ** 0.5 if len(diffs) > 1 else 0.0
+    return {
+        "n": len(diffs),
+        "meanSpecific": mean(s for s, _ in pairs),
+        "meanNeutral": mean(n for _, n in pairs),
+        "meanDiff": round(md, 3),
+        "dz": round(md / sd, 3) if sd > 0 else None,
+    }
+
+
+def item_quality_mean(rating_rows: list[dict[str, Any]], participant_id: str, block_index: int, stage: str) -> float | None:
+    item_id = blind_item_id(participant_id, block_index, stage)
+    values = [
+        score_mean(row["ratings"])
+        for row in rating_rows
+        if row["itemId"] == item_id and isinstance(row.get("ratings"), dict)
+    ]
+    values = [value for value in values if value is not None]
+    return mean(values) if values else None
+
+
+def calibration_score(decisions: list[dict[str, Any]], probe_validity: dict[str, str], strict: bool) -> float | None:
+    if not decisions:
+        return None
+    good = 0
+    for decision in decisions:
+        validity = probe_validity.get(decision.get("probeId", ""))
+        choice = decision.get("decision")
+        if validity == "flawed" and choice in {"rejected", "questioned", "reframed"}:
+            good += 1
+        elif validity == "valid":
+            if strict and choice == "accepted":
+                good += 1
+            elif not strict and choice in {"accepted", "reframed"}:
+                good += 1
+    return good / len(decisions)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="data")
@@ -132,44 +145,60 @@ def main() -> int:
     data_dir = Path(args.data_dir)
     participants = load_json_dir(data_dir / "participants")
     ratings = load_json_dir(data_dir / "ratings")
+    events = []
+    event_log = data_dir / "events.jsonl"
+    if event_log.exists():
+        with event_log.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
 
-    study1 = [record for record in participants if record.get("study") == "study1"]
-    completed = [record for record in study1 if record.get("completedAt") or record.get("status") == "completed"]
+    completed = [p for p in participants if p.get("completedAt") or p.get("status") == "completed"]
+
+    # Validity gates (per participant): attention check + both blocks have valid proposals.
     valid = []
     invalid_reasons: dict[str, int] = {}
-    for participant in study1:
+    for participant in participants:
         reasons = []
-        if participant.get("preSurvey", {}).get("attentionCheck") != 5:
+        if (participant.get("preSurvey") or {}).get("attentionCheck") != 5:
             reasons.append("attention")
-        if proposal_issues(participant.get("initialProposal"), 320):
-            reasons.append("initial_proposal")
-        if proposal_issues(participant.get("finalProposal"), 560):
-            reasons.append("final_proposal")
-        if not participant.get("postSurvey"):
-            reasons.append("post_survey")
+        for block in participant.get("blocks", []):
+            if proposal_issues(block.get("initialProposal"), MIN_INITIAL_CHARS):
+                reasons.append(f"block{block.get('index')}_initial")
+            if proposal_issues(block.get("finalProposal"), MIN_FINAL_CHARS):
+                reasons.append(f"block{block.get('index')}_final")
+        if not participant.get("finalSurvey"):
+            reasons.append("final_survey")
         if reasons:
             for reason in reasons:
                 invalid_reasons[reason] = invalid_reasons.get(reason, 0) + 1
         else:
             valid.append(participant)
 
-    rating_rows = expand_ratings(ratings)
-    expected_items = [
-        {
-            "itemId": blind_item_id(participant["id"], stage),
-            "participantId": participant["id"],
-            "conditionId": participant.get("conditionId"),
-            "stage": stage,
-        }
-        for participant in study1
-        if participant.get("initialProposal") and participant.get("finalProposal")
-        for stage in ("initial", "final")
+    # Blind rating coverage.
+    rating_rows = [
+        {"itemId": r.get("itemId"), "raterId": str(r.get("raterId") or "anonymous").strip().lower(), "ratings": r.get("ratings")}
+        for r in ratings
+        if r.get("itemId") and isinstance(r.get("ratings"), dict)
     ]
-
+    expected_items = []
+    for participant in participants:
+        for block in participant.get("blocks", []):
+            if block.get("initialProposal") and block.get("finalProposal"):
+                for stage in ("initial", "final"):
+                    expected_items.append(
+                        {
+                            "itemId": blind_item_id(participant["id"], block["index"], stage),
+                            "participantId": participant["id"],
+                            "blockIndex": block["index"],
+                            "arm": block.get("arm"),
+                            "stage": stage,
+                        }
+                    )
     raters_by_item: dict[str, set[str]] = {}
     for row in rating_rows:
         raters_by_item.setdefault(row["itemId"], set()).add(row["raterId"])
-
     coverage = [
         {
             **item,
@@ -200,45 +229,61 @@ def main() -> int:
             )
         reliability[dimension] = krippendorff_alpha(groups)
 
-    item_means: dict[tuple[str, str], list[float]] = {}
-    for row in rating_rows:
-        value = score_mean(row["ratings"])
-        if value is not None:
-            item_means.setdefault((row["participantId"], row["stage"]), []).append(value)
+    # Paired improvement contrast (specific block vs neutral block per participant).
+    improvement_pairs: list[tuple[float, float]] = []
+    for participant in participants:
+        arm_block = {b.get("arm"): b for b in participant.get("blocks", [])}
+        spec, neut = arm_block.get("specific"), arm_block.get("neutral")
+        if not spec or not neut:
+            continue
+        spec_imp_i = item_quality_mean(rating_rows, participant["id"], spec["index"], "initial")
+        spec_imp_f = item_quality_mean(rating_rows, participant["id"], spec["index"], "final")
+        neut_imp_i = item_quality_mean(rating_rows, participant["id"], neut["index"], "initial")
+        neut_imp_f = item_quality_mean(rating_rows, participant["id"], neut["index"], "final")
+        if None not in (spec_imp_i, spec_imp_f, neut_imp_i, neut_imp_f):
+            improvement_pairs.append(((spec_imp_f - spec_imp_i), (neut_imp_f - neut_imp_i)))
 
-    participant_deltas = []
-    for participant in study1:
-        initial_values = item_means.get((participant["id"], "initial"), [])
-        final_values = item_means.get((participant["id"], "final"), [])
-        if len(initial_values) >= args.min_raters and len(final_values) >= args.min_raters:
-            participant_deltas.append(
-                {
-                    "participantId": participant["id"],
-                    "conditionId": participant.get("conditionId"),
-                    "initialMean": mean(initial_values),
-                    "finalMean": mean(final_values),
-                    "delta": mean(final_values) - mean(initial_values),
-                }
-            )
+    # Paired calibration contrast from probe_decision events.
+    probe_validity = {
+        "A-valid-peer-ai-feedback": "valid", "A-flawed-privacy-collection": "flawed",
+        "A-valid-behavioral-measures": "valid", "A-flawed-satisfaction-only": "flawed",
+        "B-valid-second-opinion": "valid", "B-flawed-keylogging-collection": "flawed",
+        "B-valid-decision-tracking": "valid", "B-flawed-confidence-only": "flawed",
+    }
+    decisions_by_pb: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for event in events:
+        if event.get("type") == "probe_decision":
+            payload = event.get("payload", {})
+            key = (event.get("participantId"), payload.get("blockIndex"))
+            decisions_by_pb.setdefault(key, []).append(payload)
+    calibration_pairs: list[tuple[float, float]] = []
+    for participant in participants:
+        arm_block = {b.get("arm"): b for b in participant.get("blocks", [])}
+        spec, neut = arm_block.get("specific"), arm_block.get("neutral")
+        if not spec or not neut:
+            continue
+        spec_cal = calibration_score(decisions_by_pb.get((participant["id"], spec["index"]), []), probe_validity, strict=True)
+        neut_cal = calibration_score(decisions_by_pb.get((participant["id"], neut["index"]), []), probe_validity, strict=True)
+        if spec_cal is not None and neut_cal is not None:
+            calibration_pairs.append((spec_cal, neut_cal))
 
     if args.write_item_csv:
         with Path(args.write_item_csv).open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["itemId", "participantId", "conditionId", "stage", "ratedCount", "neededRatings"],
+                fieldnames=["itemId", "participantId", "blockIndex", "arm", "stage", "ratedCount", "neededRatings"],
             )
             writer.writeheader()
             writer.writerows(coverage)
 
     summary = {
         "participants": {
-            "study1_created": len(study1),
-            "study1_completed": len(completed),
-            "study1_valid_by_quality_gates": len(valid),
+            "created": len(participants),
+            "completed": len(completed),
+            "valid_by_quality_gates": len(valid),
             "invalid_reasons": invalid_reasons,
-            "condition_counts_valid": {
-                condition: sum(1 for participant in valid if participant.get("conditionId") == condition)
-                for condition in CONDITIONS
+            "sequence_counts": {
+                seq: sum(1 for p in participants if p.get("sequenceId") == seq) for seq in SEQUENCES
             },
         },
         "blind_rating": {
@@ -248,7 +293,10 @@ def main() -> int:
             "items_with_min_raters": sum(1 for item in coverage if item["ratedCount"] >= args.min_raters),
             "duplicate_item_rater_pairs": duplicate_ratings,
             "reliability_alpha_interval": reliability,
-            "participant_deltas_with_min_raters": len(participant_deltas),
+        },
+        "paired_contrasts": {
+            "improvement_specific_vs_neutral": paired_summary(improvement_pairs),
+            "calibration_strict_specific_vs_neutral": paired_summary(calibration_pairs),
         },
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

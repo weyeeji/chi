@@ -8,15 +8,8 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   finalProposalFields,
-  manipulationDimensions,
   raterDimensions,
-  roles,
-  seededProbes,
-  study0Materials,
-  taskTopics,
-  type PersonalityLevel,
-  type Role,
-  type Study
+  taskTopics
 } from "../src/shared/experiment.js";
 import { buildAnalytics } from "./analytics.js";
 import { generateDirectTurn, generateRound } from "./agents.js";
@@ -79,17 +72,19 @@ function badRequest(message: string) {
   return error;
 }
 
-function publicParticipant<T extends { condition?: unknown; conditionId?: unknown }>(participant: T) {
-  const { condition: _condition, conditionId: _conditionId, ...publicRecord } = participant;
-  return publicRecord;
+// The arm (neutral/specific) is the only field a participant must never see, since it is
+// the manipulation. Topics and sequence ids are not informative on their own.
+function publicParticipant(participant: ParticipantRecord) {
+  return {
+    ...participant,
+    blocks: participant.blocks.map(({ arm: _arm, ...block }) => block)
+  };
 }
 
 const protectedParticipantKeys = new Set([
   "id",
-  "study",
-  "condition",
-  "conditionId",
-  "topicId",
+  "sequenceId",
+  "blocks",
   "createdAt",
   "updatedAt"
 ]);
@@ -112,6 +107,9 @@ function proposalQualityIssues(proposal: unknown, minChars: number) {
   return issues;
 }
 
+const MIN_INITIAL_CHARS = 280;
+const MIN_FINAL_CHARS = 480;
+
 function validateRatingRecord(record: unknown, expectedKeys: string[], label: string) {
   if (!record || typeof record !== "object" || Array.isArray(record)) {
     throw badRequest(`${label} ratings must be an object`);
@@ -123,80 +121,73 @@ function validateRatingRecord(record: unknown, expectedKeys: string[], label: st
   }
 }
 
-function study0DimensionKeys() {
-  return [
-    ...manipulationDimensions.map((dimension) => dimension.key),
-    ...roles.map((role) => `suitable_${role}`)
-  ];
-}
+// PATCH body for a single block: persists the block's initial/final proposal or survey by
+// merging into the participant's block array. arm and topicId are immutable.
+const blockPatchSchema = z.object({
+  blockIndex: z.number().int().min(1).max(2),
+  initialProposal: z.record(z.string(), z.string()).optional(),
+  finalProposal: z.record(z.string(), z.string()).optional(),
+  blockSurvey: z.record(z.string(), z.unknown()).optional()
+});
 
-function validateStudy0Ratings(value: unknown) {
-  if (!Array.isArray(value)) throw badRequest("Study 0 ratings must be an array");
-  if (value.length !== 8) throw badRequest("Study 0 submission must contain exactly 8 counterbalanced items");
-  const itemIds = new Set(study0Materials.map((item) => item.id));
-  const pairs = new Set<string>();
-  const seen = new Set<string>();
-  for (const row of value) {
-    if (!row || typeof row !== "object" || Array.isArray(row)) throw badRequest("Study 0 rating rows must be objects");
-    const record = row as Record<string, unknown>;
-    const itemId = String(record.itemId ?? "");
-    const role = record.role as Role;
-    const level = record.level as PersonalityLevel;
-    if (!itemIds.has(itemId)) throw badRequest(`Unknown Study 0 item: ${itemId}`);
-    if (seen.has(itemId)) throw badRequest(`Duplicate Study 0 item: ${itemId}`);
-    seen.add(itemId);
-    if (!roles.includes(role)) throw badRequest(`Invalid Study 0 role: ${String(role)}`);
-    if (level !== "neutral" && level !== "specific") throw badRequest(`Invalid Study 0 level: ${String(level)}`);
-    pairs.add(`${role}:${level}`);
-    validateRatingRecord(record.ratings, study0DimensionKeys(), `Study 0 item ${itemId}`);
+function applyBlockPatch(existing: ParticipantRecord, body: unknown): Partial<ParticipantRecord> {
+  const patch = blockPatchSchema.parse(body);
+  const block = existing.blocks.find((item) => item.index === patch.blockIndex);
+  if (!block) throw badRequest(`Block ${patch.blockIndex} not found for this participant`);
+  if (patch.initialProposal) {
+    const issues = proposalQualityIssues(patch.initialProposal, MIN_INITIAL_CHARS);
+    if (issues.length) throw badRequest(`Initial proposal failed quality gate: ${issues.join("; ")}`);
   }
-  if (pairs.size !== 8) throw badRequest("Study 0 ratings must cover every role x level pair exactly once");
-}
-
-function proposalMinChars(study: Study, key: "initialProposal" | "finalProposal") {
-  if (study === "study1" && key === "initialProposal") return 320;
-  if (study === "study1" && key === "finalProposal") return 560;
-  if (study === "study2" && key === "initialProposal") return 260;
-  return 0;
+  if (patch.finalProposal) {
+    const issues = proposalQualityIssues(patch.finalProposal, MIN_FINAL_CHARS);
+    if (issues.length) throw badRequest(`Final proposal failed quality gate: ${issues.join("; ")}`);
+  }
+  const blocks = existing.blocks.map((item) =>
+    item.index === patch.blockIndex
+      ? {
+        ...item,
+        ...(patch.initialProposal ? { initialProposal: patch.initialProposal } : {}),
+        ...(patch.finalProposal ? { finalProposal: patch.finalProposal } : {}),
+        ...(patch.blockSurvey ? { blockSurvey: patch.blockSurvey } : {})
+      }
+      : item
+  );
+  return { blocks };
 }
 
 function validateParticipantPatch(existing: ParticipantRecord, body: unknown): Partial<ParticipantRecord> {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw badRequest("Participant patch must be an object");
   }
+  const raw = body as Record<string, unknown>;
+  // Block-scoped update.
+  if ("blockIndex" in raw) {
+    const blockPatch = applyBlockPatch(existing, raw);
+    const status = typeof raw.status === "string" ? raw.status : undefined;
+    return status ? { ...blockPatch, status } : blockPatch;
+  }
+  // Participant-scoped update (pre-survey, final survey, status, completion).
   const patch = Object.fromEntries(
-    Object.entries(body as Record<string, unknown>).filter(([key]) => !protectedParticipantKeys.has(key))
+    Object.entries(raw).filter(([key]) => !protectedParticipantKeys.has(key))
   ) as Partial<ParticipantRecord>;
   const next = { ...existing, ...patch };
-
   if (patch.preSurvey || next.status === "pre_completed") {
     if (Number(next.preSurvey?.attentionCheck) !== 5) {
       throw badRequest("Attention check failed; expected preSurvey.attentionCheck to equal 5");
     }
   }
-  if (patch.initialProposal || next.status === "initial_completed") {
-    const issues = proposalQualityIssues(next.initialProposal, proposalMinChars(existing.study, "initialProposal"));
-    if (issues.length) throw badRequest(`Initial proposal failed quality gate: ${issues.join("; ")}`);
-  }
-  if (patch.finalProposal || next.status === "final_completed") {
-    const issues = proposalQualityIssues(next.finalProposal, proposalMinChars(existing.study, "finalProposal"));
-    if (issues.length) throw badRequest(`Final proposal failed quality gate: ${issues.join("; ")}`);
-  }
-  if (patch.study0Ratings) {
-    if (existing.study !== "study0") throw badRequest("study0Ratings can only be saved for Study 0 participants");
-    validateStudy0Ratings(patch.study0Ratings);
-  }
-  if (next.status === "completed" && existing.study === "study1") {
-    if (!next.postSurvey) throw badRequest("Study 1 completion requires postSurvey");
-    const finalIssues = proposalQualityIssues(next.finalProposal, proposalMinChars(existing.study, "finalProposal"));
-    if (finalIssues.length) throw badRequest(`Study 1 completion requires a valid final proposal: ${finalIssues.join("; ")}`);
+  if (next.status === "completed") {
+    if (!next.finalSurvey) throw badRequest("Completion requires finalSurvey");
+    for (const block of next.blocks) {
+      const issues = proposalQualityIssues(block.finalProposal, MIN_FINAL_CHARS);
+      if (issues.length) throw badRequest(`Completion requires a valid final proposal for block ${block.index}: ${issues.join("; ")}`);
+    }
   }
   return patch;
 }
 
 const eventSchema = z.object({
   participantId: z.string().min(1),
-  study: z.enum(["study0", "study1", "study2"]).optional(),
   type: z.string().min(1).max(96).regex(/^[A-Za-z0-9_:-]+$/).default("client_event"),
   payload: z.record(z.string(), z.unknown()).default({})
 });
@@ -208,55 +199,57 @@ const ratingInputSchema = z.object({
   notes: z.string().max(4000).optional()
 });
 
-function blindItemId(participantId: string, stage: "initial" | "final") {
-  const salt = process.env.BLIND_ITEM_SALT ?? "role-specific-agent-personality-lab-v1";
-  return createHash("sha256").update(`${salt}:${participantId}:${stage}`).digest("base64url").slice(0, 18);
+function blindItemId(participantId: string, blockIndex: number, stage: "initial" | "final") {
+  const salt = process.env.BLIND_ITEM_SALT ?? "agent-team-personality-ab-v1";
+  return createHash("sha256").update(`${salt}:${participantId}:${blockIndex}:${stage}`).digest("base64url").slice(0, 18);
 }
 
+// Build the anonymous blind-rating worklist. Each completed-enough block contributes an
+// initial and a final item. Raters never see arm, topic-arm mapping, participant id, or
+// whether the item is the initial or final draft.
 function buildBlindRatingItems(participants: ParticipantRecord[], ratings: Awaited<ReturnType<typeof listRatings>>) {
   const raterSets = new Map<string, Set<string>>();
   for (const rating of ratings) {
-    const key = rating.itemId ?? (rating.stage ? blindItemId(rating.participantId, rating.stage) : undefined);
-    if (!key) continue;
-    const set = raterSets.get(key) ?? new Set<string>();
+    const set = raterSets.get(rating.itemId) ?? new Set<string>();
     set.add((rating.raterId || "anonymous").trim().toLowerCase());
-    raterSets.set(key, set);
+    raterSets.set(rating.itemId, set);
   }
-  return participants
-    .filter((participant) =>
-      participant.study === "study1" &&
-      participant.initialProposal &&
-      participant.finalProposal &&
-      !proposalQualityIssues(participant.initialProposal, proposalMinChars("study1", "initialProposal")).length &&
-      !proposalQualityIssues(participant.finalProposal, proposalMinChars("study1", "finalProposal")).length
-    )
-    .flatMap((participant) => (["initial", "final"] as const).map((stage) => {
-      const itemId = blindItemId(participant.id, stage);
-      const topic = taskTopics.find((item) => item.id === participant.topicId) ?? taskTopics[0];
-      const ratedCount = raterSets.get(itemId)?.size ?? 0;
-      return {
-        itemId,
-        displayId: `item-${itemId.slice(0, 10)}`,
-        participantId: participant.id,
-        stage,
-        topic: topic.en,
-        topicZh: topic.zh,
-        createdAt: participant.createdAt,
-        ratedCount,
-        neededRatings: Math.max(0, 3 - ratedCount),
-        proposal: stage === "initial" ? participant.initialProposal : participant.finalProposal
-      };
-    }));
+  return participants.flatMap((participant) =>
+    participant.blocks.flatMap((block) => {
+      if (
+        !block.initialProposal || !block.finalProposal ||
+        proposalQualityIssues(block.initialProposal, MIN_INITIAL_CHARS).length ||
+        proposalQualityIssues(block.finalProposal, MIN_FINAL_CHARS).length
+      ) {
+        return [];
+      }
+      const topic = taskTopics.find((item) => item.id === block.topicId) ?? taskTopics[0];
+      return (["initial", "final"] as const).map((stage) => {
+        const itemId = blindItemId(participant.id, block.index, stage);
+        const ratedCount = raterSets.get(itemId)?.size ?? 0;
+        return {
+          itemId,
+          displayId: `item-${itemId.slice(0, 10)}`,
+          participantId: participant.id,
+          blockIndex: block.index,
+          stage,
+          topic: topic.en,
+          topicZh: topic.zh,
+          ratedCount,
+          neededRatings: Math.max(0, 3 - ratedCount),
+          proposal: stage === "initial" ? block.initialProposal : block.finalProposal
+        };
+      });
+    })
+  );
 }
 
 const participantSchema = z.object({
-  study: z.enum(["study0", "study1", "study2"]),
   lang: z.enum(["en", "zh"]).default("zh"),
   consent: z.record(z.string(), z.unknown()).optional(),
   recruitment: z.record(z.string(), z.unknown()).optional(),
   browserInfo: z.record(z.string(), z.unknown()).optional(),
-  conditionId: z.string().optional(),
-  topicId: z.string().optional()
+  sequenceId: z.string().optional()
 });
 
 app.get("/api/health", (_req, res) => {
@@ -265,12 +258,6 @@ app.get("/api/health", (_req, res) => {
     model: process.env.AGENT_MODEL,
     agentMode: process.env.AGENT_MODE,
     hasAgentKey: Boolean(process.env.AGENT_API_KEY)
-  });
-});
-
-app.get("/api/public-config", (_req, res) => {
-  res.json({
-    probes: seededProbes.map(({ expectedBehavior: _expectedBehavior, validity: _validity, ...publicProbe }) => publicProbe)
   });
 });
 
@@ -309,7 +296,6 @@ app.patch("/api/participants/:id", async (req, res, next) => {
     await appendEvent({
       id: newId("event"),
       participantId: participant.id,
-      study: participant.study,
       type: "participant_updated",
       createdAt: new Date().toISOString(),
       payload: { keys: Object.keys(patch) }
@@ -325,13 +311,9 @@ app.post("/api/events", async (req, res, next) => {
     const input = eventSchema.parse(req.body);
     const participant = await getParticipant(input.participantId);
     if (!participant) return res.status(404).json({ error: "Participant not found" });
-    if (input.study && input.study !== participant.study) {
-      return res.status(400).json({ error: "Event study does not match participant study" });
-    }
     const event = await appendEvent({
       id: newId("event"),
       participantId: participant.id,
-      study: participant.study,
       type: input.type,
       createdAt: new Date().toISOString(),
       payload: input.payload
@@ -372,10 +354,8 @@ app.get("/api/rater/items", requireAdmin, async (_req, res) => {
   const [participants, ratings] = await Promise.all([listParticipants(), listRatings()]);
   const items = buildBlindRatingItems(participants, ratings)
     .sort((a, b) => a.ratedCount - b.ratedCount || a.displayId.localeCompare(b.displayId))
-    .map(({ participantId: _participantId, stage: _stage, createdAt: _createdAt, ...publicItem }) => publicItem);
-  res.json({
-    items
-  });
+    .map(({ participantId: _participantId, blockIndex: _blockIndex, stage: _stage, ...publicItem }) => publicItem);
+  res.json({ items });
 });
 
 app.post("/api/rater/ratings", requireAdmin, async (req, res, next) => {
@@ -388,25 +368,20 @@ app.post("/api/rater/ratings", requireAdmin, async (req, res, next) => {
     if (!item) return res.status(404).json({ error: "Blind rating item not found" });
     const normalizedRater = input.raterId.trim().toLowerCase();
     const duplicate = ratings.some((rating) =>
-      (rating.itemId ?? (rating.stage ? blindItemId(rating.participantId, rating.stage) : "")) === input.itemId &&
-      (rating.raterId || "anonymous").trim().toLowerCase() === normalizedRater
+      rating.itemId === input.itemId && (rating.raterId || "anonymous").trim().toLowerCase() === normalizedRater
     );
     if (duplicate) return res.status(409).json({ error: "This rater has already rated this item" });
     const rating = await saveRating({
       itemId: item.itemId,
       participantId: item.participantId,
+      blockIndex: item.blockIndex,
       stage: item.stage,
       raterId: input.raterId,
       ratings: input.ratings,
       notes: input.notes
     });
     res.json({
-      rating: {
-        id: rating.id,
-        itemId: rating.itemId,
-        raterId: rating.raterId,
-        createdAt: rating.createdAt
-      }
+      rating: { id: rating.id, itemId: rating.itemId, raterId: rating.raterId, createdAt: rating.createdAt }
     });
   } catch (error) {
     next(error);
@@ -450,21 +425,26 @@ function sendCsv(res: express.Response, filename: string, rows: Array<Record<str
 
 app.get("/api/export/participants.csv", requireAdmin, async (_req, res) => {
   const participants = await listParticipants();
-  sendCsv(res, "participants.csv", participants.map((participant) => ({
-    id: participant.id,
-    study: participant.study,
-    lang: participant.lang,
-    conditionId: participant.conditionId,
-    topicId: participant.topicId,
-    status: participant.status,
-    createdAt: participant.createdAt,
-    completedAt: participant.completedAt,
-    participantCode: participant.recruitment?.participantCode,
-    preSurvey: participant.preSurvey,
-    postSurvey: participant.postSurvey,
-    initialProposal: participant.initialProposal,
-    finalProposal: participant.finalProposal
-  })));
+  // One row per (participant, block) so each arm is a separate analyzable line.
+  sendCsv(res, "participants.csv", participants.flatMap((participant) =>
+    participant.blocks.map((block) => ({
+      participantId: participant.id,
+      lang: participant.lang,
+      sequenceId: participant.sequenceId,
+      blockIndex: block.index,
+      arm: block.arm,
+      topicId: block.topicId,
+      status: participant.status,
+      createdAt: participant.createdAt,
+      completedAt: participant.completedAt,
+      participantCode: participant.recruitment?.participantCode,
+      preSurvey: participant.preSurvey,
+      blockSurvey: block.blockSurvey,
+      finalSurvey: participant.finalSurvey,
+      initialProposal: block.initialProposal,
+      finalProposal: block.finalProposal
+    }))
+  ));
 });
 
 app.get("/api/export/events.csv", requireAdmin, async (_req, res) => {
@@ -472,7 +452,6 @@ app.get("/api/export/events.csv", requireAdmin, async (_req, res) => {
   sendCsv(res, "events.csv", events.map((event) => ({
     id: event.id,
     participantId: event.participantId,
-    study: event.study,
     type: event.type,
     createdAt: event.createdAt,
     payload: event.payload
@@ -485,12 +464,11 @@ app.get("/api/export/ratings.csv", requireAdmin, async (_req, res) => {
     id: rating.id,
     itemId: rating.itemId,
     participantId: rating.participantId,
+    blockIndex: rating.blockIndex,
     stage: rating.stage,
     raterId: rating.raterId,
     createdAt: rating.createdAt,
     ratings: rating.ratings,
-    initial: rating.initial,
-    final: rating.final,
     notes: rating.notes
   })));
 });

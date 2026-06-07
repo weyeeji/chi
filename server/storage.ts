@@ -2,8 +2,8 @@ import { promises as fs } from "node:fs";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Condition, Language, ProbeDecision, Study } from "../src/shared/experiment.js";
-import { conditions, taskTopics } from "../src/shared/experiment.js";
+import type { Arm, BlockPlan, Language, ProbeDecision } from "../src/shared/experiment.js";
+import { sequences } from "../src/shared/experiment.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,49 +20,49 @@ const participantsDir = path.join(dataDir, "participants");
 const ratingsDir = path.join(dataDir, "ratings");
 const eventLogPath = path.join(dataDir, "events.jsonl");
 
+// One collaboration block as stored on the participant record. arm/topicId come from the
+// assigned counterbalance sequence; proposals and the per-block survey are filled in as
+// the participant progresses through that block.
+export interface BlockRecord extends BlockPlan {
+  initialProposal?: Record<string, string>;
+  finalProposal?: Record<string, string>;
+  blockSurvey?: Record<string, unknown>;
+}
+
 export interface ParticipantRecord {
   id: string;
-  study: Study;
   lang: Language;
-  conditionId?: string;
-  condition?: Condition;
-  topicId?: string;
+  sequenceId: string;
+  blocks: BlockRecord[];
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
   consent?: Record<string, unknown>;
   recruitment?: Record<string, unknown>;
   browserInfo?: Record<string, unknown>;
-  stageTimings?: Record<string, unknown>;
   preSurvey?: Record<string, unknown>;
-  initialProposal?: Record<string, string>;
-  finalProposal?: Record<string, string>;
-  postSurvey?: Record<string, unknown>;
-  study0Ratings?: unknown[];
-  study2Controls?: Record<string, Record<string, number>>;
-  study2Notes?: string;
+  finalSurvey?: Record<string, unknown>;
   status?: string;
 }
 
 export interface EventRecord {
   id: string;
   participantId?: string;
-  study?: Study;
   type: string;
   createdAt: string;
   payload: Record<string, unknown>;
 }
 
+// A blind rating targets a single anonymous proposal item (one block, one stage).
 export interface BlindRating {
   id: string;
   participantId: string;
+  blockIndex: number;
+  stage: "initial" | "final";
   raterId: string;
   createdAt: string;
-  itemId?: string;
-  stage?: "initial" | "final";
-  ratings?: Record<string, number>;
-  initial?: Record<string, number>;
-  final?: Record<string, number>;
+  itemId: string;
+  ratings: Record<string, number>;
   notes?: string;
 }
 
@@ -106,57 +106,45 @@ export async function listParticipants(): Promise<ParticipantRecord[]> {
   return records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
-async function nextConditionForStudy1(): Promise<Condition> {
+// Round-robin assignment over the four counterbalance sequences, keeping the assigned
+// (committed) counts balanced. At small N this guarantees an even spread of arm orders
+// and arm-to-topic mappings.
+async function nextSequence() {
   const participants = await listParticipants();
-  const counts = new Map(conditions.map((condition) => [condition.id, 0]));
-  const quotaStatuses = new Set([
+  const counts = new Map(sequences.map((sequence) => [sequence.id, 0]));
+  const committedStatuses = new Set([
     "pre_completed",
-    "initial_completed",
-    "workspace_completed",
-    "final_completed",
+    "block_in_progress",
+    "block_completed",
     "completed"
   ]);
   for (const participant of participants) {
-    if (
-      participant.study === "study1" &&
-      participant.conditionId &&
-      (participant.completedAt || quotaStatuses.has(participant.status ?? ""))
-    ) {
-      counts.set(participant.conditionId, (counts.get(participant.conditionId) ?? 0) + 1);
+    if (participant.completedAt || committedStatuses.has(participant.status ?? "")) {
+      counts.set(participant.sequenceId, (counts.get(participant.sequenceId) ?? 0) + 1);
     }
   }
   const min = Math.min(...Array.from(counts.values()));
-  const candidates = conditions.filter((condition) => counts.get(condition.id) === min);
+  const candidates = sequences.filter((sequence) => counts.get(sequence.id) === min);
   return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
 export async function createParticipant(input: {
-  study: Study;
   lang: Language;
   consent?: Record<string, unknown>;
   recruitment?: Record<string, unknown>;
   browserInfo?: Record<string, unknown>;
-  conditionId?: string;
-  topicId?: string;
+  sequenceId?: string;
 }): Promise<ParticipantRecord> {
   await ensureStorage();
-  const condition = input.study === "study1"
-    ? input.conditionId
-      ? conditions.find((item) => item.id === input.conditionId) ?? (await nextConditionForStudy1())
-      : await nextConditionForStudy1()
-    : input.study === "study2"
-      ? conditions.find((item) => item.id === "C8")
-      : undefined;
-  const topic = taskTopics.find((item) => item.id === input.topicId)
-    ?? taskTopics[Math.floor(Math.random() * taskTopics.length)];
+  const sequence = input.sequenceId
+    ? sequences.find((item) => item.id === input.sequenceId) ?? (await nextSequence())
+    : await nextSequence();
   const now = new Date().toISOString();
   const record: ParticipantRecord = {
-    id: newId(input.study),
-    study: input.study,
+    id: newId("p"),
     lang: input.lang,
-    conditionId: condition?.id,
-    condition,
-    topicId: topic.id,
+    sequenceId: sequence.id,
+    blocks: sequence.blocks.map((block) => ({ ...block })),
     consent: input.consent,
     recruitment: input.recruitment,
     browserInfo: input.browserInfo,
@@ -168,12 +156,18 @@ export async function createParticipant(input: {
   await appendEvent({
     id: newId("event"),
     participantId: record.id,
-    study: input.study,
     type: "participant_created",
     createdAt: now,
-    payload: { conditionId: record.conditionId, topicId: record.topicId }
+    payload: {
+      sequenceId: record.sequenceId,
+      blocks: record.blocks.map((block) => ({ index: block.index, arm: block.arm, topicId: block.topicId }))
+    }
   });
   return record;
+}
+
+export function blockArm(participant: ParticipantRecord, blockIndex: number): Arm {
+  return participant.blocks.find((block) => block.index === blockIndex)?.arm ?? "neutral";
 }
 
 export async function getParticipant(id: string): Promise<ParticipantRecord | undefined> {

@@ -1,20 +1,17 @@
-import type { AgentMessage, Condition, Language, ProbeCard, PublicProbeCard, Role } from "../src/shared/experiment.js";
+import type { AgentMessage, Arm, Language, ProbeCard, PublicProbeCard, Role } from "../src/shared/experiment.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   collaborationRounds,
-  conditions,
   finalProposalFields,
-  roleControlDefaults,
+  probesForTopic,
   roleLabels,
-  seededProbes,
   taskTopics
 } from "../src/shared/experiment.js";
-import { appendEvent, getParticipant, newId } from "./storage.js";
+import { appendEvent, blockArm, getParticipant, newId } from "./storage.js";
 
 type PersonalityConfig = {
   globalRules: string[];
-  neutralPersonality: string[];
   roles: Record<Role, {
     roleInstruction: string[];
     neutralPersonality: string[];
@@ -44,13 +41,12 @@ const personalityConfig = readPersonalityConfig();
 interface AgentRequest {
   participantId: string;
   lang: Language;
+  blockIndex: number;
   roundIndex?: number;
   targetRole?: Role | "all";
   userMessage?: string;
   messages: AgentMessage[];
   initialProposal?: Record<string, string>;
-  finalDraft?: Record<string, string>;
-  study2Controls?: Record<string, Record<string, number>>;
 }
 
 interface AgentResponse {
@@ -58,20 +54,16 @@ interface AgentResponse {
   probes: PublicProbeCard[];
 }
 
-function conditionForParticipant(conditionId?: string): Condition {
-  return conditions.find((item) => item.id === conditionId) ?? conditions[0];
-}
-
 function estimateTokens(text: string) {
   return Math.ceil(text.length / 4);
 }
 
-function publicTaskText(topicId: string | undefined, lang: Language) {
-  const topic = taskTopics.find((item) => item.id === topicId) ?? taskTopics[0];
-  return lang === "zh" ? topic.zh : topic.en;
+function topicForBlock(participant: Awaited<ReturnType<typeof getParticipant>>, blockIndex: number) {
+  const topicId = participant?.blocks.find((block) => block.index === blockIndex)?.topicId;
+  return taskTopics.find((item) => item.id === topicId) ?? taskTopics[0];
 }
 
-function formatProposal(proposal?: Record<string, string>, lang: Language = "en") {
+function formatProposal(proposal: Record<string, string> | undefined, lang: Language) {
   if (!proposal) return lang === "zh" ? "尚未提供。" : "Not provided yet.";
   return finalProposalFields
     .map((field) => {
@@ -88,31 +80,21 @@ function recentConversation(messages: AgentMessage[]) {
     .join("\n");
 }
 
-function controlsToInstruction(role: Role, controls?: Record<string, Record<string, number>>) {
-  const roleControls = controls?.[role] ?? roleControlDefaults[role];
-  const entries = Object.entries(roleControls).map(([key, value]) => `${key}: ${value}/5`);
-  return `Study 2 user-tuned controls for this role:\n${entries.join("\n")}`;
-}
-
 function buildSystemPrompt(input: {
   role: Role;
   lang: Language;
-  condition: Condition;
+  arm: Arm;
   topic: string;
   roundIndex?: number;
   direct: boolean;
   userMessage?: string;
   initialProposal?: Record<string, string>;
   messages: AgentMessage[];
-  study2Controls?: Record<string, Record<string, number>>;
   probesForRole?: ProbeCard[];
 }) {
-  const level: "neutral" | "specific" = input.study2Controls ? "specific" : input.condition[input.role];
-  const personality = input.study2Controls
-    ? `${personalityConfig.roles[input.role].specificPersonality.join("\n")}\n${controlsToInstruction(input.role, input.study2Controls)}`
-    : level === "specific"
-      ? personalityConfig.roles[input.role].specificPersonality.join("\n")
-      : personalityConfig.roles[input.role].neutralPersonality.join("\n");
+  const personality = input.arm === "specific"
+    ? personalityConfig.roles[input.role].specificPersonality.join("\n")
+    : personalityConfig.roles[input.role].neutralPersonality.join("\n");
   const languageRule = input.lang === "zh"
     ? "Respond in Simplified Chinese. Keep role labels and measurement terms readable when useful."
     : "Respond in English.";
@@ -144,9 +126,9 @@ function buildSystemPrompt(input: {
   ].filter(Boolean).join("\n");
 }
 
-async function callModel(systemPrompt: string, role: Role, lang: Language, level: "neutral" | "specific"): Promise<string> {
+async function callModel(systemPrompt: string, role: Role, lang: Language, arm: Arm): Promise<string> {
   if (process.env.AGENT_MODE === "mock" || !process.env.AGENT_API_KEY) {
-    return mockAgentResponse(role, lang, level);
+    return mockAgentResponse(role, lang, arm);
   }
   const baseUrl = (process.env.AGENT_API_BASE_URL ?? "").replace(/\/$/, "");
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -170,17 +152,20 @@ async function callModel(systemPrompt: string, role: Role, lang: Language, level
     throw new Error(`Agent API failed: ${response.status} ${text.slice(0, 240)}`);
   }
   const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  return data.choices?.[0]?.message?.content?.trim() || mockAgentResponse(role, lang, level);
+  return data.choices?.[0]?.message?.content?.trim() || mockAgentResponse(role, lang, arm);
 }
 
-function mockAgentResponse(role: Role, lang: Language, level: "neutral" | "specific") {
+// Arm-aware fallback: a mock must match the block's arm so a failed API call in the
+// neutral arm never injects specific-voiced text (which would silently contaminate the
+// within-subjects contrast). Fallbacks are logged with the arm so they can be audited.
+function mockAgentResponse(role: Role, lang: Language, arm: Arm) {
   const roleConfig = personalityConfig.roles[role];
-  return level === "specific" ? roleConfig.mockSpecific[lang] : roleConfig.mockNeutral[lang];
+  return arm === "specific" ? roleConfig.mockSpecific[lang] : roleConfig.mockNeutral[lang];
 }
 
-// C3: verify that a seeded probe's text was actually emitted by the agent.
-// The behavioral-trust contribution assumes the probe reaches the participant verbatim;
-// LLMs may paraphrase, soften, or drop it, which would confound calibrated reliance.
+// Verify that a seeded probe's text was actually emitted by the agent. The
+// calibrated-reliance measure assumes the probe reaches the participant verbatim; LLMs
+// may paraphrase, soften, or drop it, which would confound the analysis.
 function normalizeForMatch(text: string) {
   return text.toLowerCase().replace(/[\s\p{P}]+/gu, " ").trim();
 }
@@ -193,14 +178,11 @@ function tokenOverlapRatio(probeText: string, content: string) {
   return hits / probeTokens.length;
 }
 
-// Returns a delivery verdict so the round generator can log it and analysts can
-// exclude or flag turns where the seeded suggestion was not faithfully delivered.
 function verifyProbeDelivery(probe: ProbeCard, content: string) {
   const normalizedProbe = normalizeForMatch(probe.text);
   const normalizedContent = normalizeForMatch(content);
   const verbatim = normalizedContent.includes(normalizedProbe);
   const overlap = tokenOverlapRatio(probe.text, content);
-  // Verbatim or high lexical overlap (>=0.7 of content tokens present) counts as delivered.
   const delivered = verbatim || overlap >= 0.7;
   return { probeId: probe.id, validity: probe.validity, delivered, verbatim, overlap: Number(overlap.toFixed(2)) };
 }
@@ -208,28 +190,27 @@ function verifyProbeDelivery(probe: ProbeCard, content: string) {
 export async function generateRound(input: AgentRequest): Promise<AgentResponse> {
   const participant = await getParticipant(input.participantId);
   if (!participant) throw new Error("Participant not found");
-  const condition = conditionForParticipant(participant.conditionId);
+  const arm = blockArm(participant, input.blockIndex);
   const round = collaborationRounds.find((item) => item.index === input.roundIndex);
   if (!round) throw new Error("Invalid round");
-  const topic = publicTaskText(participant.topicId, input.lang);
+  const topicConfig = topicForBlock(participant, input.blockIndex);
+  const topic = input.lang === "zh" ? topicConfig.zh : topicConfig.en;
   const generated: AgentMessage[] = [];
-  const roundProbes = seededProbes.filter((probe) => probe.round === round.index);
+  const roundProbes = probesForTopic(topicConfig.id).filter((probe) => probe.round === round.index);
   const embeddedProbeIds = new Set<string>();
 
   for (const role of round.roles) {
     const probesForRole = roundProbes.filter((probe) => probe.sourceRole === role && !embeddedProbeIds.has(probe.id));
     probesForRole.forEach((probe) => embeddedProbeIds.add(probe.id));
-    const level = condition[role];
     const prompt = buildSystemPrompt({
       role,
       lang: input.lang,
-      condition,
+      arm,
       topic,
       roundIndex: round.index,
       direct: false,
       initialProposal: input.initialProposal,
       messages: [...input.messages, ...generated],
-      study2Controls: input.study2Controls,
       probesForRole
     });
     const started = Date.now();
@@ -237,13 +218,12 @@ export async function generateRound(input: AgentRequest): Promise<AgentResponse>
     let error: string | undefined;
     let usedFallback = false;
     try {
-      content = await callModel(prompt, role, input.lang, level);
+      content = await callModel(prompt, role, input.lang, arm);
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
-      content = mockAgentResponse(role, input.lang, level);
+      content = mockAgentResponse(role, input.lang, arm);
       usedFallback = true;
     }
-    // C3: verify each seeded probe assigned to this role was faithfully delivered in the emitted text.
     const probeDelivery = probesForRole.map((probe) => verifyProbeDelivery(probe, content));
     const message: AgentMessage = {
       id: newId("msg"),
@@ -251,6 +231,7 @@ export async function generateRound(input: AgentRequest): Promise<AgentResponse>
       content,
       createdAt: new Date().toISOString(),
       round: round.index,
+      block: input.blockIndex,
       latencyMs: Date.now() - started,
       tokenEstimate: estimateTokens(content)
     };
@@ -258,14 +239,14 @@ export async function generateRound(input: AgentRequest): Promise<AgentResponse>
     await appendEvent({
       id: newId("event"),
       participantId: input.participantId,
-      study: participant.study,
       type: "agent_message",
       createdAt: message.createdAt,
       payload: {
         message,
         prompt,
-        conditionId: participant.conditionId,
-        level,
+        blockIndex: input.blockIndex,
+        arm,
+        topicId: topicConfig.id,
         usedFallback,
         wordCount: content.trim().split(/\s+/).filter(Boolean).length,
         probeDelivery,
@@ -280,10 +261,9 @@ export async function generateRound(input: AgentRequest): Promise<AgentResponse>
     await appendEvent({
       id: newId("event"),
       participantId: input.participantId,
-      study: participant.study,
       type: "seeded_probes_revealed",
       createdAt: new Date().toISOString(),
-      payload: { roundIndex: round.index, probeIds: probes.map((probe) => probe.id) }
+      payload: { blockIndex: input.blockIndex, roundIndex: round.index, probeIds: probes.map((probe) => probe.id) }
     });
   }
   return { messages: generated, probes };
@@ -295,43 +275,41 @@ export async function generateDirectTurn(input: AgentRequest): Promise<AgentResp
   const targetRoles = input.targetRole && input.targetRole !== "all"
     ? [input.targetRole]
     : (["coordinator", "ideator", "critic", "verifier"] as Role[]);
-  const condition = conditionForParticipant(participant.conditionId);
-  const topic = publicTaskText(participant.topicId, input.lang);
+  const arm = blockArm(participant, input.blockIndex);
+  const topicConfig = topicForBlock(participant, input.blockIndex);
+  const topic = input.lang === "zh" ? topicConfig.zh : topicConfig.en;
   const generated: AgentMessage[] = [];
 
   if (input.userMessage?.trim()) {
     await appendEvent({
       id: newId("event"),
       participantId: input.participantId,
-      study: participant.study,
       type: "user_message",
       createdAt: new Date().toISOString(),
-      payload: { content: input.userMessage, targetRole: input.targetRole ?? "all" }
+      payload: { content: input.userMessage, targetRole: input.targetRole ?? "all", blockIndex: input.blockIndex }
     });
   }
 
   for (const role of targetRoles) {
-    const level = condition[role];
     const prompt = buildSystemPrompt({
       role,
       lang: input.lang,
-      condition,
+      arm,
       topic,
       direct: true,
       userMessage: input.userMessage,
       initialProposal: input.initialProposal,
-      messages: [...input.messages, ...generated],
-      study2Controls: input.study2Controls
+      messages: [...input.messages, ...generated]
     });
     const started = Date.now();
     let content: string;
     let error: string | undefined;
     let usedFallback = false;
     try {
-      content = await callModel(prompt, role, input.lang, level);
+      content = await callModel(prompt, role, input.lang, arm);
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
-      content = mockAgentResponse(role, input.lang, level);
+      content = mockAgentResponse(role, input.lang, arm);
       usedFallback = true;
     }
     const message: AgentMessage = {
@@ -339,6 +317,7 @@ export async function generateDirectTurn(input: AgentRequest): Promise<AgentResp
       role,
       content,
       createdAt: new Date().toISOString(),
+      block: input.blockIndex,
       targetRole: input.targetRole ?? "all",
       latencyMs: Date.now() - started,
       tokenEstimate: estimateTokens(content)
@@ -347,14 +326,14 @@ export async function generateDirectTurn(input: AgentRequest): Promise<AgentResp
     await appendEvent({
       id: newId("event"),
       participantId: input.participantId,
-      study: participant.study,
       type: "agent_message",
       createdAt: message.createdAt,
       payload: {
         message,
         prompt,
-        conditionId: participant.conditionId,
-        level,
+        blockIndex: input.blockIndex,
+        arm,
+        topicId: topicConfig.id,
         usedFallback,
         wordCount: content.trim().split(/\s+/).filter(Boolean).length,
         direct: true,

@@ -8,15 +8,12 @@ import {
   Download,
   Gauge,
   Globe2,
-  Lightbulb,
   LineChart,
   MessageSquare,
   RotateCcw,
   Save,
   Send,
   ShieldCheck,
-  SlidersHorizontal,
-  Target,
   UserCheck,
   X
 } from "lucide-react";
@@ -24,7 +21,6 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
-  Cell,
   Legend,
   ResponsiveContainer,
   Tooltip,
@@ -35,52 +31,63 @@ import { apiGet, apiSend, downloadAdminFile } from "./api";
 import {
   collaborationRounds,
   finalProposalFields,
-  manipulationDimensions,
   raterDimensions,
-  roleControlDefaults,
-  roleControlLabels,
   roleLabels,
   roles,
-  study0Materials,
   taskTopics,
   type AgentMessage,
   type Language,
   type ProbeDecision,
   type PublicProbeCard,
-  type Role,
-  type Study,
-  type Study0Material
+  type Role
 } from "./shared/experiment";
+
+// The participant-facing record never exposes the arm of each block.
+type PublicBlock = {
+  index: number;
+  topicId: string;
+  initialProposal?: Record<string, string>;
+  finalProposal?: Record<string, string>;
+  blockSurvey?: Record<string, unknown>;
+};
 
 type Participant = {
   id: string;
-  study: Study;
   lang: Language;
-  conditionId?: string;
-  topicId?: string;
-  initialProposal?: Record<string, string>;
-  finalProposal?: Record<string, string>;
-  study2Controls?: Record<string, Record<string, number>>;
+  sequenceId: string;
+  blocks: PublicBlock[];
   completedAt?: string;
 };
 
-type Stage = "landing" | "pre" | "initial" | "tutorial" | "workspace" | "final" | "post" | "complete";
 type ProposalValue = Record<string, string>;
+
+// Linear participant flow across the two within-subjects blocks.
+type Stage =
+  | "landing"
+  | "pre"
+  | "block1-initial"
+  | "block1-tutorial"
+  | "block1-workspace"
+  | "block1-final"
+  | "block1-survey"
+  | "block2-intro"
+  | "block2-initial"
+  | "block2-workspace"
+  | "block2-final"
+  | "block2-survey"
+  | "final-survey"
+  | "complete";
 
 const copy = {
   zh: {
-    title: "角色特定智能体人格实验系统",
-    subtitle: "面向 CHI 2027 的 human-agent team 协作研究原型",
+    title: "Agent 团队人格协作实验",
+    subtitle: "面向 CHI 的 human-agent team 被试内研究",
     start: "开始实验",
     continue: "继续",
     saveContinue: "保存并继续",
     reset: "重置本地流程",
     language: "语言",
-    study1: "Study 1 主实验",
-    study0: "Study 0 操控验证",
-    study2: "Study 2 控制探针",
     analytics: "分析仪表盘",
-    admin: "管理员",
     rater: "盲评入口",
     consent: "知情同意",
     preSurvey: "实验前问卷",
@@ -88,7 +95,8 @@ const copy = {
     tutorial: "角色说明",
     workspace: "团队协作工作区",
     finalProposal: "最终方案",
-    postSurvey: "实验后问卷",
+    blockSurvey: "本轮协作问卷",
+    finalSurvey: "对比问卷",
     complete: "完成",
     task: "任务",
     nextRound: "运行下一轮",
@@ -102,28 +110,22 @@ const copy = {
     questioned: "质疑",
     reframed: "改写",
     noMessages: "还没有对话。运行第一轮开始。",
-    roundDone: "四轮已完成，可以提交最终方案。",
+    roundDone: "本轮已完成，可以提交方案。",
     loading: "智能体正在回复...",
     notes: "研究备注",
     submit: "提交",
-    controls: "角色级人格控制",
-    reflection: "访谈/think-aloud 记录",
-    emptyData: "暂无数据。完成实验或导入盲评后会显示图表。",
+    emptyData: "暂无数据。完成实验或添加盲评后会显示图表。",
     download: "下载数据"
   },
   en: {
-    title: "Role-Specific Agent Personality Lab",
-    subtitle: "A CHI 2027-oriented human-agent team collaboration prototype",
+    title: "Agent-Team Personality Collaboration Study",
+    subtitle: "A CHI-oriented within-subjects human-agent team study",
     start: "Start",
     continue: "Continue",
     saveContinue: "Save and continue",
     reset: "Reset local flow",
     language: "Language",
-    study1: "Study 1 Main Experiment",
-    study0: "Study 0 Manipulation Check",
-    study2: "Study 2 Control Probe",
     analytics: "Analytics",
-    admin: "Admin",
     rater: "Blind Rating",
     consent: "Consent",
     preSurvey: "Pre-survey",
@@ -131,7 +133,8 @@ const copy = {
     tutorial: "Role tutorial",
     workspace: "Team workspace",
     finalProposal: "Final proposal",
-    postSurvey: "Post-survey",
+    blockSurvey: "Collaboration survey",
+    finalSurvey: "Comparison survey",
     complete: "Complete",
     task: "Task",
     nextRound: "Run next round",
@@ -145,12 +148,10 @@ const copy = {
     questioned: "Question",
     reframed: "Reframe",
     noMessages: "No conversation yet. Run round 1 to start.",
-    roundDone: "All four rounds are complete. You can submit the final proposal.",
+    roundDone: "This block is complete. You can submit the proposal.",
     loading: "Agents are responding...",
     notes: "Research notes",
     submit: "Submit",
-    controls: "Role-level personality controls",
-    reflection: "Interview / think-aloud notes",
     emptyData: "No data yet. Complete sessions or add blind ratings to populate charts.",
     download: "Download data"
   }
@@ -164,6 +165,9 @@ const roleColors: Record<Role | "user" | "system", string> = {
   user: "#222222",
   system: "#64748b"
 };
+
+const MIN_INITIAL_CHARS = 280;
+const MIN_FINAL_CHARS = 480;
 
 function useLanguage() {
   const [lang, setLangState] = useState<Language>(() => (localStorage.getItem("lab-lang") as Language) || "zh");
@@ -208,41 +212,12 @@ function collectBrowserInfo() {
 }
 
 function proposalStats(proposal: ProposalValue) {
-  const fields = Object.fromEntries(
-    finalProposalFields.map((field) => {
-      const text = proposal[field.key] ?? "";
-      return [field.key, {
-        chars: text.length,
-        words: text.trim() ? text.trim().split(/\s+/).length : 0
-      }];
-    })
-  );
   return {
-    fields,
     totalChars: Object.values(proposal).join("").length,
     totalWords: Object.values(proposal).join(" ").trim()
       ? Object.values(proposal).join(" ").trim().split(/\s+/).length
       : 0
   };
-}
-
-function hashString(value: string) {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
-function selectStudy0Materials(participantId: string): Study0Material[] {
-  const selected = roles.flatMap((role) =>
-    (["neutral", "specific"] as const).map((level) => {
-      const candidates = study0Materials.filter((item) => item.role === role && item.level === level);
-      return candidates[hashString(`${participantId}-${role}-${level}`) % candidates.length];
-    })
-  );
-  return selected.sort((a, b) => hashString(`${participantId}-${a.id}`) - hashString(`${participantId}-${b.id}`));
 }
 
 function proposalQualityError(proposal: ProposalValue, lang: Language, minChars: number) {
@@ -256,7 +231,7 @@ function proposalQualityError(proposal: ProposalValue, lang: Language, minChars:
   }
   if (totalChars < minChars) {
     return lang === "zh"
-      ? `当前总长度约 ${totalChars} 字。为了保证初稿/终稿可盲评，请至少写到 ${minChars} 字。`
+      ? `当前总长度约 ${totalChars} 字。请至少写到 ${minChars} 字，以便盲评。`
       : `Current total length is about ${totalChars} characters. Please write at least ${minChars} characters so raters can evaluate the proposal.`;
   }
   return "";
@@ -266,13 +241,14 @@ async function logClientEvent(participant: Participant | undefined, type: string
   if (!participant) return;
   await apiSend("/api/events", "POST", {
     participantId: participant.id,
-    study: participant.study,
     type,
-    payload: {
-      ...payload,
-      clientTime: new Date().toISOString()
-    }
+    payload: { ...payload, clientTime: new Date().toISOString() }
   });
+}
+
+function topicText(topicId: string | undefined, lang: Language) {
+  const topic = taskTopics.find((item) => item.id === topicId) ?? taskTopics[0];
+  return lang === "zh" ? topic.zh : topic.en;
 }
 
 function AppHeader({ lang, setLang, adminMode }: { lang: Language; setLang: (lang: Language) => void; adminMode: boolean }) {
@@ -287,7 +263,7 @@ function AppHeader({ lang, setLang, adminMode }: { lang: Language; setLang: (lan
           <>
             <a href="/admin">{t(lang, "analytics")}</a>
             <a href="/admin/rater">{t(lang, "rater")}</a>
-            <a href="/">{t(lang, "study1")}</a>
+            <a href="/">{lang === "zh" ? "参与者入口" : "Participant study"}</a>
           </>
         ) : (
           <span className="participant-nav-note">{lang === "zh" ? "研究参与者入口" : "Participant study"}</span>
@@ -309,35 +285,41 @@ function App() {
   return (
     <>
       <AppHeader lang={lang} setLang={setLang} adminMode={adminMode} />
-      {adminMode ? <AdminPage lang={lang} initialView={path.includes("rater") ? "rater" : "analytics"} />
-          : path.startsWith("/study0") ? <Study0Page lang={lang} />
-            : path.startsWith("/study2") ? <Study2Page lang={lang} />
-              : <Study1Page lang={lang} />}
+      {adminMode
+        ? <AdminPage lang={lang} initialView={path.includes("rater") ? "rater" : "analytics"} />
+        : <StudyPage lang={lang} />}
     </>
   );
 }
 
+const STAGE_ORDER: Stage[] = [
+  "landing", "pre",
+  "block1-initial", "block1-tutorial", "block1-workspace", "block1-final", "block1-survey",
+  "block2-intro", "block2-initial", "block2-workspace", "block2-final", "block2-survey",
+  "final-survey", "complete"
+];
+
 function StageRail({ stage, lang }: { stage: Stage; lang: Language }) {
-  const stages: Stage[] = ["landing", "pre", "initial", "tutorial", "workspace", "final", "post", "complete"];
-  const labels: Record<Stage, string> = {
-    landing: t(lang, "start"),
-    pre: t(lang, "preSurvey"),
-    initial: t(lang, "initialProposal"),
-    tutorial: t(lang, "tutorial"),
-    workspace: t(lang, "workspace"),
-    final: t(lang, "finalProposal"),
-    post: t(lang, "postSurvey"),
-    complete: t(lang, "complete")
-  };
-  const current = stages.indexOf(stage);
+  // Collapse the fine-grained stages into seven human-readable milestones.
+  const milestones: Array<{ label: string; stages: Stage[] }> = [
+    { label: t(lang, "preSurvey"), stages: ["pre"] },
+    { label: lang === "zh" ? "第一轮协作" : "Block 1", stages: ["block1-initial", "block1-tutorial", "block1-workspace", "block1-final", "block1-survey"] },
+    { label: lang === "zh" ? "第二轮协作" : "Block 2", stages: ["block2-intro", "block2-initial", "block2-workspace", "block2-final", "block2-survey"] },
+    { label: t(lang, "finalSurvey"), stages: ["final-survey"] },
+    { label: t(lang, "complete"), stages: ["complete"] }
+  ];
+  const currentIndex = STAGE_ORDER.indexOf(stage);
   return (
     <div className="stage-rail">
-      {stages.map((item, index) => (
-        <div className={`stage-pill ${index <= current ? "done" : ""}`} key={item}>
-          <span>{index + 1}</span>
-          {labels[item]}
-        </div>
-      ))}
+      {milestones.map((milestone, index) => {
+        const reached = milestone.stages.some((s) => STAGE_ORDER.indexOf(s) <= currentIndex);
+        return (
+          <div className={`stage-pill ${reached ? "done" : ""}`} key={milestone.label}>
+            <span>{index + 1}</span>
+            {milestone.label}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -360,13 +342,7 @@ function SecondaryButton(props: React.ButtonHTMLAttributes<HTMLButtonElement> & 
   );
 }
 
-function SliderField({
-  label,
-  value,
-  onChange,
-  minLabel,
-  maxLabel
-}: {
+function SliderField({ label, value, onChange, minLabel, maxLabel }: {
   label: string;
   value: number;
   onChange: (value: number) => void;
@@ -409,31 +385,6 @@ function ProposalEditor({ lang, value, onChange }: {
   );
 }
 
-function topicText(topicId: string | undefined, lang: Language) {
-  const topic = taskTopics.find((item) => item.id === topicId) ?? taskTopics[0];
-  return lang === "zh" ? topic.zh : topic.en;
-}
-
-function LandingPanel({ lang, title, description, onStart }: {
-  lang: Language;
-  title: string;
-  description: string;
-  onStart: () => void;
-}) {
-  return (
-    <main className="page-shell">
-      <section className="intro-band">
-        <div>
-          <p className="eyebrow">{t(lang, "subtitle")}</p>
-          <h1>{title}</h1>
-          <p>{description}</p>
-        </div>
-        <PrimaryButton onClick={onStart} icon={<ChevronRight size={18} />}>{t(lang, "start")}</PrimaryButton>
-      </section>
-    </main>
-  );
-}
-
 function ConsentLanding({ lang, title, description, duration, onStart }: {
   lang: Language;
   title: string;
@@ -446,6 +397,7 @@ function ConsentLanding({ lang, title, description, duration, onStart }: {
   const points = lang === "zh"
     ? [
       `预计时长：${duration}。`,
+      "本研究分两轮，你将与同一组四个智能体角色协作两次，并完成相关方案与问卷。",
       "系统会记录你的方案文本、对话消息、建议采纳/拒绝、问卷回答、时间戳、响应延迟和浏览器环境信息。",
       "系统不会要求你输入真实姓名、密码、账号、成绩或其他敏感身份信息。",
       "你可以在实验中拒绝智能体建议，最终方案由你决定。",
@@ -453,6 +405,7 @@ function ConsentLanding({ lang, title, description, duration, onStart }: {
     ]
     : [
       `Estimated duration: ${duration}.`,
+      "The study has two blocks; you collaborate twice with the same four agent roles and complete related proposals and surveys.",
       "The system logs proposal text, messages, suggestion decisions, survey responses, timestamps, response latency, and browser environment metadata.",
       "The system does not ask for real names, passwords, account credentials, grades, or sensitive identity information.",
       "You may reject agent suggestions; the final proposal remains your decision.",
@@ -483,36 +436,33 @@ function ConsentLanding({ lang, title, description, duration, onStart }: {
   );
 }
 
-function Study1Page({ lang }: { lang: Language }) {
-  const [session, setSession, resetSession] = useSession<{
-    stage: Stage;
-    participant?: Participant;
-    preSurvey?: Record<string, unknown>;
-    initialProposal?: ProposalValue;
-    finalProposal?: ProposalValue;
-    postSurvey?: Record<string, unknown>;
-  }>("study1-session", { stage: "landing" });
+type SessionState = {
+  stage: Stage;
+  participant?: Participant;
+  // Local working copies of proposals so reloads do not lose drafts.
+  drafts: Record<string, ProposalValue>;
+};
+
+function StudyPage({ lang }: { lang: Language }) {
+  const [session, setSession, resetSession] = useSession<SessionState>("study-session", { stage: "landing", drafts: {} });
   const [busy, setBusy] = useState(false);
+  const participant = session.participant;
+
+  function block(index: number) {
+    return participant?.blocks.find((b) => b.index === index);
+  }
 
   async function start(participantCode: string) {
     setBusy(true);
     try {
       const result = await apiSend<{ participant: Participant }>("/api/participants", "POST", {
-        study: "study1",
         lang,
-        consent: {
-          accepted: true,
-          acceptedAt: new Date().toISOString(),
-          version: "recruitment-ready-v1"
-        },
-        recruitment: {
-          participantCode: participantCode || null,
-          source: "local-or-study-link"
-        },
+        consent: { accepted: true, acceptedAt: new Date().toISOString(), version: "within-subjects-ab-v1" },
+        recruitment: { participantCode: participantCode || null, source: "local-or-study-link" },
         browserInfo: collectBrowserInfo()
       });
       await logClientEvent(result.participant, "stage_entered", { stage: "pre" });
-      setSession({ stage: "pre", participant: result.participant });
+      setSession({ stage: "pre", participant: result.participant, drafts: {} });
     } catch (error) {
       console.error(error);
       alert(lang === "zh" ? "无法连接实验服务器，请联系研究者。" : "Could not reach the study server. Please contact the researcher.");
@@ -521,15 +471,19 @@ function Study1Page({ lang }: { lang: Language }) {
     }
   }
 
+  function go(stage: Stage, patch?: Partial<SessionState>) {
+    setSession({ ...session, ...patch, stage });
+  }
+
   if (session.stage === "landing") {
     return (
       <ConsentLanding
         lang={lang}
-        title={t(lang, "study1")}
+        title={t(lang, "title")}
         description={lang === "zh"
-          ? "参与者先独立提出方案，再与四个角色固定的智能体协作，最后提交最终方案和问卷。系统会记录轮次、消息、建议采纳/拒绝和问卷数据。"
-          : "Participants draft an initial proposal, collaborate with four role-fixed agents, then submit a final proposal and post-survey. The system logs rounds, messages, suggestion decisions, and survey data."}
-        duration={lang === "zh" ? "40-45 分钟" : "40-45 minutes"}
+          ? "你将与同一组四个角色固定的智能体协作两次。每一轮先独立写初稿，再与团队协作，最后提交方案和简短问卷。两轮使用不同的设计题目。"
+          : "You collaborate twice with the same four role-fixed agents. In each block you draft a proposal, collaborate with the team, then submit a proposal and a short survey. The two blocks use different design briefs."}
+        duration={lang === "zh" ? "50-60 分钟" : "50-60 minutes"}
         onStart={start}
       />
     );
@@ -538,6 +492,7 @@ function Study1Page({ lang }: { lang: Language }) {
   return (
     <main className="page-shell">
       <StageRail stage={session.stage} lang={lang} />
+
       {session.stage === "pre" && (
         <SurveyPanel
           lang={lang}
@@ -549,82 +504,157 @@ function Study1Page({ lang }: { lang: Language }) {
               alert(lang === "zh" ? "请按注意力检查题要求选择 5。" : "Please select 5 for the attention check item.");
               return;
             }
-            await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", { preSurvey: values, status: "pre_completed" });
-            await logClientEvent(session.participant, "stage_submitted", { stage: "pre", surveyKeys: Object.keys(values) });
-            await logClientEvent(session.participant, "stage_entered", { stage: "initial" });
-            setSession({ ...session, preSurvey: values, stage: "initial" });
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { preSurvey: values, status: "pre_completed" });
+            await logClientEvent(participant, "stage_submitted", { stage: "pre" });
+            go("block1-initial");
           }}
         />
       )}
-      {session.stage === "initial" && (
+
+      {/* ---------------- Block 1 ---------------- */}
+      {session.stage === "block1-initial" && (
         <ProposalStage
           lang={lang}
-          title={t(lang, "initialProposal")}
-          task={topicText(session.participant?.topicId, lang)}
-          value={session.initialProposal ?? {}}
-          minChars={320}
+          title={`${lang === "zh" ? "第一轮 · " : "Block 1 · "}${t(lang, "initialProposal")}`}
+          task={topicText(block(1)?.topicId, lang)}
+          value={session.drafts["b1-initial"] ?? {}}
+          minChars={MIN_INITIAL_CHARS}
           onSubmit={async (proposal) => {
-            await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", { initialProposal: proposal, status: "initial_completed" });
-            await logClientEvent(session.participant, "proposal_submitted", { stage: "initial", stats: proposalStats(proposal) });
-            await logClientEvent(session.participant, "stage_entered", { stage: "tutorial" });
-            setSession({ ...session, initialProposal: proposal, stage: "tutorial" });
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { blockIndex: 1, initialProposal: proposal, status: "block_in_progress" });
+            await logClientEvent(participant, "proposal_submitted", { block: 1, stage: "initial", stats: proposalStats(proposal) });
+            go("block1-tutorial", { drafts: { ...session.drafts, "b1-initial": proposal } });
           }}
         />
       )}
-      {session.stage === "tutorial" && (
-        <TutorialPanel
-          lang={lang}
-          onContinue={async () => {
-            await logClientEvent(session.participant, "stage_entered", { stage: "workspace" });
-            setSession({ ...session, stage: "workspace" });
-          }}
-        />
+      {session.stage === "block1-tutorial" && (
+        <TutorialPanel lang={lang} onContinue={() => go("block1-workspace")} />
       )}
-      {session.stage === "workspace" && session.participant && (
+      {session.stage === "block1-workspace" && participant && (
         <Workspace
           lang={lang}
-          participant={session.participant}
-          initialProposal={session.initialProposal ?? {}}
-          onFinish={() => setSession({ ...session, stage: "final" })}
+          participant={participant}
+          blockIndex={1}
+          initialProposal={session.drafts["b1-initial"] ?? {}}
+          onFinish={() => go("block1-final")}
         />
       )}
-      {session.stage === "final" && (
+      {session.stage === "block1-final" && (
         <ProposalStage
           lang={lang}
-          title={t(lang, "finalProposal")}
-          task={topicText(session.participant?.topicId, lang)}
-          value={session.finalProposal ?? session.initialProposal ?? {}}
-          minChars={560}
+          title={`${lang === "zh" ? "第一轮 · " : "Block 1 · "}${t(lang, "finalProposal")}`}
+          task={topicText(block(1)?.topicId, lang)}
+          value={session.drafts["b1-final"] ?? session.drafts["b1-initial"] ?? {}}
+          minChars={MIN_FINAL_CHARS}
           onSubmit={async (proposal) => {
-            await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", { finalProposal: proposal, status: "final_completed" });
-            await logClientEvent(session.participant, "proposal_submitted", { stage: "final", stats: proposalStats(proposal) });
-            await logClientEvent(session.participant, "stage_entered", { stage: "post" });
-            setSession({ ...session, finalProposal: proposal, stage: "post" });
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { blockIndex: 1, finalProposal: proposal });
+            await logClientEvent(participant, "proposal_submitted", { block: 1, stage: "final", stats: proposalStats(proposal) });
+            go("block1-survey", { drafts: { ...session.drafts, "b1-final": proposal } });
           }}
         />
       )}
-      {session.stage === "post" && (
+      {session.stage === "block1-survey" && (
         <SurveyPanel
           lang={lang}
-          title={t(lang, "postSurvey")}
-          fields={postSurveyFields(lang)}
-          textFields={postSurveyTextFields(lang)}
+          title={`${lang === "zh" ? "第一轮 · " : "Block 1 · "}${t(lang, "blockSurvey")}`}
+          fields={blockSurveyFields(lang)}
+          textFields={blockSurveyTextFields(lang)}
           onSubmit={async (values) => {
-            await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", {
-              postSurvey: values,
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { blockIndex: 1, blockSurvey: values });
+            await logClientEvent(participant, "stage_submitted", { stage: "block1-survey" });
+            go("block2-intro");
+          }}
+        />
+      )}
+
+      {/* ---------------- Block transition ---------------- */}
+      {session.stage === "block2-intro" && (
+        <section className="work-panel narrow">
+          <h2>{lang === "zh" ? "进入第二轮协作" : "Starting Block 2"}</h2>
+          <p>{lang === "zh"
+            ? "接下来是第二轮。你会与同一个四角色团队合作，但题目不同。这一次团队的协作风格可能与上一轮有所不同——请像第一轮一样自然地协作。"
+            : "Next is the second block. You will work with the same four-role team on a different brief. The team's collaboration style may differ from the last block — please collaborate as naturally as you did before."}</p>
+          <PrimaryButton onClick={() => go("block2-initial")} icon={<ChevronRight size={18} />}>{t(lang, "continue")}</PrimaryButton>
+        </section>
+      )}
+
+      {/* ---------------- Block 2 (no tutorial repeat) ---------------- */}
+      {session.stage === "block2-initial" && (
+        <ProposalStage
+          lang={lang}
+          title={`${lang === "zh" ? "第二轮 · " : "Block 2 · "}${t(lang, "initialProposal")}`}
+          task={topicText(block(2)?.topicId, lang)}
+          value={session.drafts["b2-initial"] ?? {}}
+          minChars={MIN_INITIAL_CHARS}
+          onSubmit={async (proposal) => {
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { blockIndex: 2, initialProposal: proposal });
+            await logClientEvent(participant, "proposal_submitted", { block: 2, stage: "initial", stats: proposalStats(proposal) });
+            go("block2-workspace", { drafts: { ...session.drafts, "b2-initial": proposal } });
+          }}
+        />
+      )}
+      {session.stage === "block2-workspace" && participant && (
+        <Workspace
+          lang={lang}
+          participant={participant}
+          blockIndex={2}
+          initialProposal={session.drafts["b2-initial"] ?? {}}
+          onFinish={() => go("block2-final")}
+        />
+      )}
+      {session.stage === "block2-final" && (
+        <ProposalStage
+          lang={lang}
+          title={`${lang === "zh" ? "第二轮 · " : "Block 2 · "}${t(lang, "finalProposal")}`}
+          task={topicText(block(2)?.topicId, lang)}
+          value={session.drafts["b2-final"] ?? session.drafts["b2-initial"] ?? {}}
+          minChars={MIN_FINAL_CHARS}
+          onSubmit={async (proposal) => {
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { blockIndex: 2, finalProposal: proposal, status: "block_completed" });
+            await logClientEvent(participant, "proposal_submitted", { block: 2, stage: "final", stats: proposalStats(proposal) });
+            go("block2-survey", { drafts: { ...session.drafts, "b2-final": proposal } });
+          }}
+        />
+      )}
+      {session.stage === "block2-survey" && (
+        <SurveyPanel
+          lang={lang}
+          title={`${lang === "zh" ? "第二轮 · " : "Block 2 · "}${t(lang, "blockSurvey")}`}
+          fields={blockSurveyFields(lang)}
+          textFields={blockSurveyTextFields(lang)}
+          onSubmit={async (values) => {
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", { blockIndex: 2, blockSurvey: values });
+            await logClientEvent(participant, "stage_submitted", { stage: "block2-survey" });
+            go("final-survey");
+          }}
+        />
+      )}
+
+      {/* ---------------- Final comparison survey ---------------- */}
+      {session.stage === "final-survey" && (
+        <SurveyPanel
+          lang={lang}
+          title={t(lang, "finalSurvey")}
+          fields={finalSurveyFields(lang)}
+          textFields={finalSurveyTextFields(lang)}
+          onSubmit={async (values) => {
+            await apiSend(`/api/participants/${participant?.id}`, "PATCH", {
+              finalSurvey: values,
               completedAt: new Date().toISOString(),
               status: "completed"
             });
-            await logClientEvent(session.participant, "stage_submitted", { stage: "post", surveyKeys: Object.keys(values) });
-            setSession({ ...session, postSurvey: values, stage: "complete" });
+            await logClientEvent(participant, "stage_submitted", { stage: "final-survey" });
+            go("complete");
           }}
         />
       )}
+
       {session.stage === "complete" && (
         <CompletionPanel
           lang={lang}
           resetSession={resetSession}
-          message={lang === "zh" ? "主实验流程已完成。感谢参与。" : "The main experiment flow is complete. Thank you for participating."}
+          message={lang === "zh"
+            ? "实验已完成，感谢参与。说明：本研究比较了两种智能体团队风格，其中一种刻意包含了几条有缺陷的建议（如默认收集隐私数据、只用满意度评估），用于观察你如何校准依赖。请不要在真实系统中实施这些有缺陷的做法。"
+            : "The study is complete. Thank you. Debrief: this study compared two agent-team styles and deliberately seeded a few flawed suggestions (e.g., collecting private data by default, satisfaction-only evaluation) to observe how you calibrate reliance. Please do not implement those flawed practices in a real system."}
         />
       )}
       {busy && <div className="floating-status">{t(lang, "loading")}</div>}
@@ -641,7 +671,6 @@ function preSurveyFields(lang: Language) {
     { key: "domainFamiliarity", label: lang === "zh" ? "我熟悉 AI literacy / HCI 设计任务" : "I am familiar with AI literacy / HCI design tasks" },
     { key: "creativeSelfEfficacy", label: lang === "zh" ? "我有信心提出有创意的设计方案" : "I am confident in generating creative design ideas" },
     { key: "needForCognition", label: lang === "zh" ? "我喜欢深入分析复杂问题" : "I enjoy deeply analyzing complex problems" },
-    { key: "collaborationPreference", label: lang === "zh" ? "我喜欢与多个意见不同的助手协作" : "I like collaborating with multiple assistants that offer different perspectives" },
     { key: "attentionCheck", label: lang === "zh" ? "注意力检查：请为本题选择 5" : "Attention check: please select 5 for this item" }
   ];
 }
@@ -649,33 +678,32 @@ function preSurveyFields(lang: Language) {
 function preSurveyTextFields(lang: Language) {
   return [
     { key: "ageRange", label: lang === "zh" ? "年龄范围（可选，如 18-24）" : "Age range (optional, e.g., 18-24)" },
-    { key: "educationOrRole", label: lang === "zh" ? "教育/职业背景（可选）" : "Education/work background (optional)" },
-    { key: "priorDesignExperience", label: lang === "zh" ? "你是否做过 HCI/UX/设计研究任务？（可选）" : "Have you done HCI/UX/design research tasks before? (optional)" }
+    { key: "educationOrRole", label: lang === "zh" ? "教育/职业背景（可选）" : "Education/work background (optional)" }
   ];
 }
 
-function postSurveyFields(lang: Language) {
+// Per-block survey: the within-block experience measures that will be contrasted between
+// the neutral and specific arms.
+function blockSurveyFields(lang: Language) {
   return [
-    { key: "mentalDemand", label: lang === "zh" ? "任务的心理负荷很高" : "The task was mentally demanding" },
+    { key: "mentalDemand", label: lang === "zh" ? "这一轮任务的心理负荷很高" : "This block was mentally demanding" },
     { key: "temporalDemand", label: lang === "zh" ? "我感到时间压力很高" : "I felt high time pressure" },
-    { key: "effort", label: lang === "zh" ? "完成任务需要很多努力" : "Completing the task required a lot of effort" },
-    { key: "frustration", label: lang === "zh" ? "协作过程让我感到挫败" : "The collaboration felt frustrating" },
+    { key: "effort", label: lang === "zh" ? "完成这一轮需要很多努力" : "Completing this block required a lot of effort" },
+    { key: "frustration", label: lang === "zh" ? "这一轮协作让我感到挫败" : "This block felt frustrating" },
     { key: "roleClarity", label: lang === "zh" ? "我能清楚分辨每个智能体负责什么" : "I could tell what each agent was responsible for" },
     { key: "askRightAgent", label: lang === "zh" ? "我知道应该向哪个智能体询问哪类问题" : "I knew which agent to ask for which kind of help" },
     { key: "interpretDisagreement", label: lang === "zh" ? "我能理解智能体之间的分歧" : "I could interpret disagreements among agents" },
     { key: "styleRoleFit", label: lang === "zh" ? "每个智能体的表达风格符合它的角色" : "Each agent's communication style fit its role" },
     { key: "constructiveConflict", label: lang === "zh" ? "智能体之间的分歧帮助我改进方案" : "Disagreements among agents helped me improve the proposal" },
     { key: "critiqueUseful", label: lang === "zh" ? "批评性意见是有用的，而不是阻碍性的" : "Critical comments were useful rather than obstructive" },
-    { key: "evidenceSeeking", label: lang === "zh" ? "系统促使我寻找证据或评估标准" : "The system encouraged me to seek evidence or evaluation criteria" },
-    { key: "calibratedRelianceSelfReport", label: lang === "zh" ? "我知道什么时候应该采纳或质疑智能体建议" : "I knew when to accept or question agent suggestions" },
-    { key: "trustTeam", label: lang === "zh" ? "我信任这个智能体团队能帮助我完成任务" : "I trusted the agent team to help me complete the task" },
+    { key: "trustTeam", label: lang === "zh" ? "我信任这个团队能帮助我完成任务" : "I trusted this team to help me complete the task" },
     { key: "overRelianceConcern", label: lang === "zh" ? "我担心自己过度依赖了智能体建议" : "I worry that I over-relied on agent suggestions" },
     { key: "feltPushed", label: lang === "zh" ? "我觉得被智能体推向某个方向" : "I felt pushed toward the agents' preferred direction" },
     { key: "tooForceful", label: lang === "zh" ? "有些智能体显得过于强势" : "Some agents felt too forceful" },
     { key: "rejectWithoutPenalty", label: lang === "zh" ? "我觉得可以拒绝智能体建议而没有负担" : "I felt able to reject agent advice without penalty" },
     { key: "ownership", label: lang === "zh" ? "最终方案仍然像是我自己的决定" : "The final proposal still felt like my own decision" },
-    { key: "satisfaction", label: lang === "zh" ? "我对协作体验满意" : "I was satisfied with the collaboration" },
-    { key: "reuseIntent", label: lang === "zh" ? "我愿意在类似任务中再次使用这种多智能体工作区" : "I would use this multi-agent workspace again for similar tasks" },
+    { key: "satisfaction", label: lang === "zh" ? "我对这一轮协作体验满意" : "I was satisfied with this block's collaboration" },
+    // In-context manipulation check.
     { key: "coordinatorStructured", label: lang === "zh" ? "组织者表现得结构化且善于推进流程" : "The Coordinator was structured and process-oriented" },
     { key: "ideatorExploratory", label: lang === "zh" ? "发想者表现得开放且善于拓展方案" : "The Ideator was exploratory and broadened the design space" },
     { key: "criticSkeptical", label: lang === "zh" ? "批评者表现得直接且会挑战假设" : "The Critic was direct and challenged assumptions" },
@@ -683,12 +711,26 @@ function postSurveyFields(lang: Language) {
   ];
 }
 
-function postSurveyTextFields(lang: Language) {
+function blockSurveyTextFields(lang: Language) {
   return [
-    { key: "mostHelpfulAgent", label: lang === "zh" ? "哪个智能体最帮助你？为什么？" : "Which agent helped you most, and why?" },
-    { key: "leastHelpfulAgent", label: lang === "zh" ? "哪个智能体最没有帮助或造成干扰？为什么？" : "Which agent was least helpful or most disruptive, and why?" },
-    { key: "decisionMoment", label: lang === "zh" ? "有没有某个建议让你改变、质疑或坚持自己的想法？请描述。" : "Describe a moment when a suggestion changed, challenged, or reinforced your thinking." },
-    { key: "pressureMoment", label: lang === "zh" ? "有没有感到被推动、被说服或失去主导感？请描述。" : "Describe any moment when you felt pushed, persuaded, or less in control." },
+    { key: "mostHelpfulAgent", label: lang === "zh" ? "这一轮哪个智能体最帮助你？为什么？" : "Which agent helped you most this block, and why?" },
+    { key: "decisionMoment", label: lang === "zh" ? "有没有某个建议让你改变、质疑或坚持自己的想法？请描述。" : "Describe a moment when a suggestion changed, challenged, or reinforced your thinking." }
+  ];
+}
+
+// Final comparison survey: head-to-head preference between the two blocks.
+function finalSurveyFields(lang: Language) {
+  return [
+    { key: "preferredBlockOverall", label: lang === "zh" ? "总体而言，我更喜欢第二轮的团队风格（1=更喜欢第一轮，7=更喜欢第二轮）" : "Overall I preferred the second block's team style (1=prefer block 1, 7=prefer block 2)" },
+    { key: "moreHelpfulBlock", label: lang === "zh" ? "第二轮的团队对完成任务更有帮助（1=第一轮，7=第二轮）" : "The second block's team was more helpful for the task (1=block 1, 7=block 2)" },
+    { key: "morePressureBlock", label: lang === "zh" ? "第二轮让我感到更大压力（1=第一轮，7=第二轮）" : "The second block felt more pressuring (1=block 1, 7=block 2)" }
+  ];
+}
+
+function finalSurveyTextFields(lang: Language) {
+  return [
+    { key: "blockDifference", label: lang === "zh" ? "你觉得两轮的智能体团队有什么不同？" : "How did the two agent teams differ, in your view?" },
+    { key: "controlWish", label: lang === "zh" ? "如果可以调节智能体的风格，你最想调哪个角色、怎么调？" : "If you could tune the agents' styles, which role would you most want to adjust, and how?" },
     { key: "improvementSuggestion", label: lang === "zh" ? "你会如何改进这个多智能体协作界面？" : "How would you improve this multi-agent collaboration interface?" }
   ];
 }
@@ -717,7 +759,7 @@ function SurveyPanel({ lang, title, fields, textFields, onSubmit }: {
           />
         ))}
       </div>
-      {(textFields ?? [{ key: "openText", label: lang === "zh" ? "补充说明（可选）" : "Optional comment" }]).map((field) => (
+      {(textFields ?? []).map((field) => (
         <label className="text-field" key={field.key}>
           <span>{field.label}</span>
           <textarea
@@ -780,6 +822,9 @@ function TutorialPanel({ lang, onContinue }: { lang: Language; onContinue: () =>
         <div>
           <p className="eyebrow">{t(lang, "tutorial")}</p>
           <h2>{lang === "zh" ? "四个智能体角色" : "Four Agent Roles"}</h2>
+          <p>{lang === "zh"
+            ? "你将与同一组四个角色协作两轮。每个角色的职责固定，下面是它们的分工。"
+            : "You will collaborate with the same four roles across two blocks. Each role has a fixed responsibility, described below."}</p>
         </div>
         <PrimaryButton onClick={onContinue} icon={<ChevronRight size={18} />}>{t(lang, "continue")}</PrimaryButton>
       </div>
@@ -812,11 +857,11 @@ function roleDescription(role: Role, lang: Language) {
   return lang === "zh" ? zh[role] : en[role];
 }
 
-function Workspace({ lang, participant, initialProposal, study2Controls, onFinish }: {
+function Workspace({ lang, participant, blockIndex, initialProposal, onFinish }: {
   lang: Language;
   participant: Participant;
+  blockIndex: number;
   initialProposal: ProposalValue;
-  study2Controls?: Record<string, Record<string, number>>;
   onFinish: () => void;
 }) {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
@@ -827,14 +872,14 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
   const [targetRole, setTargetRole] = useState<Role | "all">("all");
   const [userMessage, setUserMessage] = useState("");
   const [loading, setLoading] = useState(false);
-  const [notes, setNotes] = useState("");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const currentRound = collaborationRounds[roundIndex];
+  const topicId = participant.blocks.find((b) => b.index === blockIndex)?.topicId;
   const decisionCounts = useMemo(() => ({
-    accepted: Object.values(decisions).filter((decision) => decision === "accepted").length,
-    rejected: Object.values(decisions).filter((decision) => decision === "rejected").length,
-    questioned: Object.values(decisions).filter((decision) => decision === "questioned").length,
-    reframed: Object.values(decisions).filter((decision) => decision === "reframed").length
+    accepted: Object.values(decisions).filter((d) => d === "accepted").length,
+    rejected: Object.values(decisions).filter((d) => d === "rejected").length,
+    questioned: Object.values(decisions).filter((d) => d === "questioned").length,
+    reframed: Object.values(decisions).filter((d) => d === "reframed").length
   }), [decisions]);
 
   useEffect(() => {
@@ -846,22 +891,23 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
     if (!currentRound || loading) return;
     setLoading(true);
     await logClientEvent(participant, "round_started", {
+      block: blockIndex,
       roundIndex: currentRound.index,
-      roundTitle: lang === "zh" ? currentRound.titleZh : currentRound.titleEn,
       priorMessageCount: messages.length
     });
     const result = await apiSend<{ messages: AgentMessage[]; probes: PublicProbeCard[] }>("/api/agent/round", "POST", {
       participantId: participant.id,
       lang,
+      blockIndex,
       roundIndex: currentRound.index,
       messages,
-      initialProposal,
-      study2Controls
+      initialProposal
     });
     setMessages([...messages, ...result.messages]);
     setProbes([...probes, ...result.probes]);
     setRoundIndex(roundIndex + 1);
     await logClientEvent(participant, "round_completed", {
+      block: blockIndex,
       roundIndex: currentRound.index,
       generatedMessages: result.messages.length,
       revealedProbes: result.probes.map((probe) => probe.id)
@@ -881,24 +927,21 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
     setLoading(true);
     setMessages((prev) => [...prev, userTurn]);
     await logClientEvent(participant, "direct_turn_started", {
+      block: blockIndex,
       targetRole,
-      userMessageChars: userMessage.length,
-      priorMessageCount: messages.length
+      userMessageChars: userMessage.length
     });
     const result = await apiSend<{ messages: AgentMessage[]; probes: PublicProbeCard[] }>("/api/agent/direct", "POST", {
       participantId: participant.id,
       lang,
+      blockIndex,
       targetRole,
       userMessage,
       messages: [...messages, userTurn],
-      initialProposal,
-      study2Controls
+      initialProposal
     });
     setMessages((prev) => [...prev, ...result.messages]);
-    await logClientEvent(participant, "direct_turn_completed", {
-      targetRole,
-      generatedMessages: result.messages.length
-    });
+    await logClientEvent(participant, "direct_turn_completed", { block: blockIndex, targetRole, generatedMessages: result.messages.length });
     setUserMessage("");
     setLoading(false);
   }
@@ -907,24 +950,15 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
     setDecisions({ ...decisions, [probe.id]: decision });
     await apiSend("/api/events", "POST", {
       participantId: participant.id,
-      study: participant.study,
       type: "probe_decision",
       payload: {
+        blockIndex,
         probeId: probe.id,
         decision,
         reason: probeNotes[probe.id] ?? "",
         round: probe.round,
         sourceRole: probe.sourceRole
       }
-    });
-  }
-
-  async function saveNotes() {
-    await apiSend("/api/events", "POST", {
-      participantId: participant.id,
-      study: participant.study,
-      type: "workspace_notes",
-      payload: { notes }
     });
   }
 
@@ -935,8 +969,8 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
         : "Please handle every suggestion in the decision board before moving to the final proposal.");
       return;
     }
-    await apiSend(`/api/participants/${participant.id}`, "PATCH", { status: "workspace_completed" });
     await logClientEvent(participant, "workspace_completed", {
+      block: blockIndex,
       elapsedSeconds,
       messageCount: messages.length,
       probeDecisionCount: Object.keys(decisions).length,
@@ -949,7 +983,7 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
     <section className="workspace-grid">
       <aside className="task-panel">
         <p className="eyebrow">{t(lang, "task")}</p>
-        <h2>{topicText(participant.topicId, lang)}</h2>
+        <h2>{topicText(topicId, lang)}</h2>
         <div className="timer-strip">
           <Gauge size={16} />
           <span>{lang === "zh" ? "协作计时" : "Collaboration timer"}</span>
@@ -967,18 +1001,13 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
       <main className="conversation-panel">
         <div className="round-toolbar">
           <div>
-            <p className="eyebrow">{currentRound ? `${lang === "zh" ? currentRound.titleZh : currentRound.titleEn}` : t(lang, "roundDone")}</p>
-            <h2>{t(lang, "workspace")}</h2>
+            <p className="eyebrow">{currentRound ? (lang === "zh" ? currentRound.titleZh : currentRound.titleEn) : t(lang, "roundDone")}</p>
+            <h2>{lang === "zh" ? `第 ${blockIndex} 轮 · ${t(lang, "workspace")}` : `Block ${blockIndex} · ${t(lang, "workspace")}`}</h2>
           </div>
           {currentRound ? (
             <PrimaryButton onClick={runRound} disabled={loading} icon={<LineChart size={18} />}>{t(lang, "nextRound")}</PrimaryButton>
           ) : (
-            <PrimaryButton
-              onClick={finishWorkspace}
-              icon={<ClipboardCheck size={18} />}
-            >
-              {t(lang, "finalProposal")}
-            </PrimaryButton>
+            <PrimaryButton onClick={finishWorkspace} icon={<ClipboardCheck size={18} />}>{t(lang, "finalProposal")}</PrimaryButton>
           )}
         </div>
         <div className="timeline">
@@ -1010,7 +1039,7 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
       </main>
       <aside className="board-panel">
         <div className="board-section">
-          <h3><Target size={18} /> {t(lang, "probes")}</h3>
+          <h3><Check size={18} /> {t(lang, "probes")}</h3>
           <div className="decision-summary">
             <span><Check size={14} /> {decisionCounts.accepted}</span>
             <span><X size={14} /> {decisionCounts.rejected}</span>
@@ -1051,13 +1080,8 @@ function Workspace({ lang, participant, initialProposal, study2Controls, onFinis
               />
             </div>
           ))}
-          {!probes.length && <p className="muted">{lang === "zh" ? "第 2-4 轮中，智能体提出的关键建议会在这里记录，供你采纳、拒绝、质疑或改写。" : "In rounds 2-4, key suggestions raised by the agents will be logged here so you can accept, reject, question, or reframe them."}</p>}
+          {!probes.length && <p className="muted">{lang === "zh" ? "第 2-3 轮中，智能体提出的关键建议会在这里记录，供你采纳、拒绝、质疑或改写。" : "In rounds 2-3, key suggestions raised by the agents will be logged here so you can accept, reject, question, or reframe them."}</p>}
         </div>
-        <label className="text-field">
-          <span>{t(lang, "notes")}</span>
-          <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={6} />
-        </label>
-        <SecondaryButton onClick={saveNotes} icon={<Save size={16} />}>{lang === "zh" ? "保存备注" : "Save notes"}</SecondaryButton>
       </aside>
     </section>
   );
@@ -1079,280 +1103,6 @@ function CompletionPanel({ lang, message, resetSession }: { lang: Language; mess
         <SecondaryButton onClick={resetSession} icon={<RotateCcw size={18} />}>{t(lang, "reset")}</SecondaryButton>
       </div>
     </section>
-  );
-}
-
-function Study0Page({ lang }: { lang: Language }) {
-  const [session, setSession, resetSession] = useSession<{
-    participant?: Participant;
-    stage: "landing" | "rating" | "complete";
-    ratings?: Record<string, Record<string, number>>;
-  }>("study0-session", { stage: "landing" });
-  const [ratings, setRatings] = useState<Record<string, Record<string, number>>>(session.ratings ?? {});
-  const selectedMaterials = useMemo(
-    () => session.participant ? selectStudy0Materials(session.participant.id) : [],
-    [session.participant]
-  );
-  const suitability = roles.map((role) => ({
-    key: `suitable_${role}`,
-    labelEn: `Suitable for ${roleLabels[role].en}`,
-    labelZh: `适合${roleLabels[role].zh}`
-  }));
-  const dimensions = [...manipulationDimensions, ...suitability];
-
-  async function start(participantCode: string) {
-    try {
-      const result = await apiSend<{ participant: Participant }>("/api/participants", "POST", {
-        study: "study0",
-        lang,
-        consent: {
-          accepted: true,
-          acceptedAt: new Date().toISOString(),
-          version: "recruitment-ready-v1"
-        },
-        recruitment: {
-          participantCode: participantCode || null,
-          source: "local-or-study-link"
-        },
-        browserInfo: collectBrowserInfo()
-      });
-      await logClientEvent(result.participant, "stage_entered", { stage: "study0_rating" });
-      setSession({ stage: "rating", participant: result.participant });
-    } catch (error) {
-      console.error(error);
-      alert(lang === "zh" ? "无法连接实验服务器，请联系研究者。" : "Could not reach the study server. Please contact the researcher.");
-    }
-  }
-
-  async function submit() {
-    const payload = selectedMaterials.map((item) => ({
-      itemId: item.id,
-      scenarioId: item.scenarioId,
-      role: item.role,
-      level: item.level,
-      ratings: ratings[item.id] ?? {}
-    }));
-    await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", {
-      study0Ratings: payload,
-      completedAt: new Date().toISOString(),
-      status: "completed"
-    });
-    await logClientEvent(session.participant, "study0_ratings_submitted", {
-      itemCount: payload.length,
-      ratedDimensions: dimensions.length
-    });
-    setSession({ ...session, ratings, stage: "complete" });
-  }
-
-  if (session.stage === "landing") {
-    return (
-      <ConsentLanding
-        lang={lang}
-        title={t(lang, "study0")}
-        description={lang === "zh"
-          ? "验证四种角色特定人格表达是否能被用户感知，并检查它们是否与能力、礼貌、啰嗦或不适感混淆。"
-          : "Validate whether role-specific personality expressions are perceivable and not confounded with competence, politeness, verbosity, or discomfort."}
-        duration={lang === "zh" ? "10-12 分钟" : "10-12 minutes"}
-        onStart={start}
-      />
-    );
-  }
-
-  if (session.stage === "complete") {
-    return <main className="page-shell"><CompletionPanel lang={lang} resetSession={resetSession} message={lang === "zh" ? "Study 0 数据已保存。" : "Study 0 data has been saved."} /></main>;
-  }
-
-  return (
-    <main className="page-shell">
-      <section className="work-panel">
-        <div className="section-heading">
-          <div>
-            <p className="eyebrow">{t(lang, "study0")}</p>
-            <h2>{lang === "zh" ? "人格片段评分" : "Personality Snippet Ratings"}</h2>
-          </div>
-          <PrimaryButton onClick={submit} icon={<Save size={18} />}>{t(lang, "submit")}</PrimaryButton>
-        </div>
-        <div className="snippet-list">
-          {selectedMaterials.map((item, index) => (
-            <article className="snippet-card" key={item.id}>
-              <p className="eyebrow">{lang === "zh" ? `片段 ${index + 1}` : `Snippet ${index + 1}`}</p>
-              <p className="scenario-brief">{lang === "zh" ? item.scenarioZh : item.scenarioEn}</p>
-              <p>{lang === "zh" ? item.zh : item.en}</p>
-              <div className="rating-grid">
-                {dimensions.map((dimension) => (
-                  <SliderField
-                    key={dimension.key}
-                    label={lang === "zh" ? dimension.labelZh : dimension.labelEn}
-                    value={ratings[item.id]?.[dimension.key] ?? 4}
-                    onChange={(value) => setRatings({
-                      ...ratings,
-                      [item.id]: {
-                        ...(ratings[item.id] ?? {}),
-                        [dimension.key]: value
-                      }
-                    })}
-                  />
-                ))}
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
-    </main>
-  );
-}
-
-function Study2Page({ lang }: { lang: Language }) {
-  const [session, setSession, resetSession] = useSession<{
-    stage: "landing" | "controls" | "initial" | "workspace" | "reflection" | "complete";
-    participant?: Participant;
-    controls?: Record<string, Record<string, number>>;
-    initialProposal?: ProposalValue;
-  }>("study2-session", { stage: "landing", controls: roleControlDefaults });
-  const [controls, setControls] = useState<Record<string, Record<string, number>>>(session.controls ?? roleControlDefaults);
-  const [notes, setNotes] = useState("");
-
-  async function start(participantCode: string) {
-    const result = await apiSend<{ participant: Participant }>("/api/participants", "POST", {
-      study: "study2",
-      lang,
-      consent: {
-        accepted: true,
-        acceptedAt: new Date().toISOString(),
-        version: "recruitment-ready-v1"
-      },
-      recruitment: {
-        participantCode: participantCode || null,
-        source: "local-or-study-link"
-      },
-      browserInfo: collectBrowserInfo()
-    });
-    await logClientEvent(result.participant, "stage_entered", { stage: "controls" });
-    setSession({ ...session, stage: "controls", participant: result.participant, controls });
-  }
-
-  async function saveControls() {
-    await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", { study2Controls: controls, status: "controls_completed" });
-    await logClientEvent(session.participant, "study2_controls_submitted", { controls });
-    setSession({ ...session, controls, stage: "initial" });
-  }
-
-  if (session.stage === "landing") {
-    return (
-      <ConsentLanding
-        lang={lang}
-        title={t(lang, "study2")}
-        description={lang === "zh"
-          ? "研究参与者如何理解和调节角色级人格控制，而不是直接调 Big Five 滑杆。"
-          : "Probe how users understand and tune role-level personality controls instead of raw Big Five sliders."}
-        duration={lang === "zh" ? "45-60 分钟" : "45-60 minutes"}
-        onStart={start}
-      />
-    );
-  }
-
-  return (
-    <main className="page-shell">
-      {session.stage === "controls" && (
-        <section className="work-panel">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">{t(lang, "study2")}</p>
-              <h2>{t(lang, "controls")}</h2>
-            </div>
-            <PrimaryButton onClick={saveControls} icon={<SlidersHorizontal size={18} />}>{t(lang, "saveContinue")}</PrimaryButton>
-          </div>
-          <RoleControls lang={lang} controls={controls} onChange={setControls} />
-        </section>
-      )}
-      {session.stage === "initial" && (
-        <ProposalStage
-          lang={lang}
-          title={t(lang, "initialProposal")}
-          task={topicText(session.participant?.topicId, lang)}
-          value={session.initialProposal ?? {}}
-          minChars={260}
-          onSubmit={async (proposal) => {
-            await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", { initialProposal: proposal, status: "initial_completed" });
-            await logClientEvent(session.participant, "proposal_submitted", { stage: "study2_initial", stats: proposalStats(proposal) });
-            setSession({ ...session, initialProposal: proposal, stage: "workspace" });
-          }}
-        />
-      )}
-      {session.stage === "workspace" && session.participant && (
-        <Workspace
-          lang={lang}
-          participant={session.participant}
-          initialProposal={session.initialProposal ?? {}}
-          study2Controls={controls}
-          onFinish={() => setSession({ ...session, stage: "reflection" })}
-        />
-      )}
-      {session.stage === "reflection" && (
-        <section className="work-panel narrow">
-          <h2>{t(lang, "reflection")}</h2>
-          <label className="text-field">
-            <span>{lang === "zh" ? "访谈问题记录：你最想调哪个 agent？哪个控制最有用？哪里增加了压力或自主性？" : "Interview notes: which agent did you most want to tune, which control mattered, and where did pressure or agency change?"}</span>
-            <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={12} />
-          </label>
-          <PrimaryButton
-            onClick={async () => {
-              await apiSend(`/api/participants/${session.participant?.id}`, "PATCH", {
-                study2Controls: controls,
-                study2Notes: notes,
-                completedAt: new Date().toISOString(),
-                status: "completed"
-              });
-              await logClientEvent(session.participant, "study2_reflection_submitted", {
-                controls,
-                notesChars: notes.length
-              });
-              setSession({ ...session, stage: "complete" });
-            }}
-            icon={<Save size={18} />}
-          >
-            {t(lang, "submit")}
-          </PrimaryButton>
-        </section>
-      )}
-      {session.stage === "complete" && <CompletionPanel lang={lang} resetSession={resetSession} message={lang === "zh" ? "Study 2 控制探针已完成。" : "Study 2 control probe is complete."} />}
-    </main>
-  );
-}
-
-function RoleControls({ lang, controls, onChange }: {
-  lang: Language;
-  controls: Record<string, Record<string, number>>;
-  onChange: (controls: Record<string, Record<string, number>>) => void;
-}) {
-  return (
-    <div className="role-grid">
-      {roles.map((role) => (
-        <div className="role-card" key={role} style={{ borderTopColor: roleColors[role] }}>
-          <div className="role-token" style={{ background: roleColors[role] }}>{roleLabels[role].short}</div>
-          <h3>{roleLabels[role][lang]}</h3>
-          {(roleControlLabels[role] as Array<{ key: string; en: string; zh: string }>).map((control) => (
-            <label className="compact-slider" key={control.key}>
-              <span>{lang === "zh" ? control.zh : control.en}</span>
-              <input
-                type="range"
-                min={1}
-                max={5}
-                value={controls[role]?.[control.key] ?? 3}
-                onChange={(event) => onChange({
-                  ...controls,
-                  [role]: {
-                    ...(controls[role] ?? {}),
-                    [control.key]: Number(event.target.value)
-                  }
-                })}
-              />
-              <strong>{controls[role]?.[control.key] ?? 3}</strong>
-            </label>
-          ))}
-        </div>
-      ))}
-    </div>
   );
 }
 
@@ -1425,213 +1175,185 @@ function AnalyticsPage({ lang, adminToken }: { lang: Language; adminToken: strin
   if (error) return <section className="work-panel"><p>{error}</p></section>;
   if (!data) return <section className="work-panel"><p>{t(lang, "loading")}</p></section>;
 
-  const conditionData = data.conditionSummary.map((item: any) => ({
-    condition: item.conditionId,
-    n: item.n,
-    improvement: item.improvement ?? 0,
-    calibration: item.calibration === null ? 0 : Math.round(item.calibration * 100)
+  const contrastLabels: Record<string, string> = {
+    improvement: lang === "zh" ? "方案提升" : "Improvement",
+    finalQuality: lang === "zh" ? "终稿质量" : "Final quality",
+    calibration: lang === "zh" ? "校准依赖(宽)" : "Calibration (lenient)",
+    strictCalibration: lang === "zh" ? "校准依赖(严)" : "Calibration (strict)",
+    cognitiveLoad: lang === "zh" ? "认知负荷" : "Cognitive load",
+    roleLegibility: lang === "zh" ? "角色可辨识" : "Role legibility",
+    pressure: lang === "zh" ? "压力" : "Pressure",
+    autonomy: lang === "zh" ? "自主感" : "Autonomy",
+    constructiveConflict: lang === "zh" ? "建设性冲突" : "Constructive conflict"
+  };
+  const contrastData = (data.pairedContrasts ?? []).map((item: any) => ({
+    metric: contrastLabels[item.key] ?? item.key,
+    specific: item.meanSpecific ?? 0,
+    neutral: item.meanNeutral ?? 0,
+    diff: item.meanDiff ?? 0,
+    dz: item.dz ?? 0,
+    n: item.n
   }));
-  const mainEffectData = data.roleMainEffects.map((item: any) => ({
-    role: roleLabels[item.role as Role]?.[lang] ?? item.role,
-    diff: item.improvementDiff ?? 0,
-    high: item.improvementHigh ?? 0,
-    low: item.improvementLow ?? 0
+  const perceivedData = (data.perceivedChecks ?? []).map((item: any) => ({
+    role: item.label.slice(0, 18),
+    specific: item.meanSpecific ?? 0,
+    neutral: item.meanNeutral ?? 0
   }));
-  const probeData = data.probeSummary.map((item: any) => ({
+  const probeData = (data.probeSummary ?? []).map((item: any) => ({
     probe: item.title.slice(0, 16),
     accepted: item.accepted,
     rejected: item.rejected,
     questioned: item.questioned,
     reframed: item.reframed
   }));
-  const constructData = data.constructSummary.map((item: any) => ({
-    construct: item.label,
-    mean: item.mean ?? 0
-  }));
-  const agentRoleData = data.agentRoleSummary.map((item: any) => ({
+  const lengthData = (data.responseLengthByArm ?? []).map((item: any) => ({
     role: roleLabels[item.role as Role]?.[lang] ?? item.role,
-    latency: item.meanLatencyMs ? Math.round(item.meanLatencyMs) : 0,
-    tokens: item.meanTokenEstimate ? Math.round(item.meanTokenEstimate) : 0,
-    n: item.n
+    neutral: item.meanWordsNeutral ? Math.round(item.meanWordsNeutral) : 0,
+    specific: item.meanWordsSpecific ? Math.round(item.meanWordsSpecific) : 0
   }));
-  const funnelData = data.completionFunnel.map((item: any) => ({
-    stage: item.stage.replace("_", " "),
-    count: item.count
-  }));
-  const directedData = data.directedTurnSummary.map((item: any) => ({
-    target: item.key === "all" ? t(lang, "allAgents") : roleLabels[item.key as Role]?.[lang] ?? item.key,
+  const funnelData = (data.completionFunnel ?? []).map((item: any) => ({
+    stage: item.stage.replace(/_/g, " "),
     count: item.count
   }));
   const reliabilityData = data.ratingReliability ?? [];
   const coverageData = data.ratingCoverage ?? [];
 
   return (
-      <section className="work-panel">
-        <div className="section-heading">
-          <div>
-            <p className="eyebrow">{t(lang, "analytics")}</p>
-            <h2>{lang === "zh" ? "实验结果可视化" : "Experiment Result Visualization"}</h2>
-          </div>
-          <div className="button-row">
-            <SecondaryButton onClick={() => downloadAdminFile("/api/export/participants", "participants.json", adminToken)} icon={<Download size={16} />}>Participants</SecondaryButton>
-            <SecondaryButton onClick={() => downloadAdminFile("/api/export/events", "events.jsonl", adminToken)} icon={<Download size={16} />}>Events</SecondaryButton>
-            <SecondaryButton onClick={() => downloadAdminFile("/api/export/analytics", "analytics.json", adminToken)} icon={<Download size={16} />}>Analytics</SecondaryButton>
-            <SecondaryButton onClick={() => downloadAdminFile("/api/export/participants.csv", "participants.csv", adminToken)} icon={<Download size={16} />}>Participants CSV</SecondaryButton>
-            <SecondaryButton onClick={() => downloadAdminFile("/api/export/events.csv", "events.csv", adminToken)} icon={<Download size={16} />}>Events CSV</SecondaryButton>
-            <SecondaryButton onClick={() => downloadAdminFile("/api/export/ratings.csv", "ratings.csv", adminToken)} icon={<Download size={16} />}>Ratings CSV</SecondaryButton>
-          </div>
+    <section className="work-panel">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">{t(lang, "analytics")}</p>
+          <h2>{lang === "zh" ? "被试内对比结果" : "Within-Subjects Results"}</h2>
         </div>
-        <div className="metric-grid">
-          <Metric icon={<UserCheck />} label="Participants" value={data.counts.participants} />
-          <Metric icon={<ClipboardCheck />} label="Completed Study 1" value={data.counts.completedStudy1} />
-          <Metric icon={<Gauge />} label="Blind ratings" value={data.counts.ratings} />
-          <Metric icon={<ClipboardCheck />} label="Fully rated items" value={`${data.counts.fullyRatedBlindItems ?? 0}/${data.counts.expectedBlindItems ?? 0}`} />
-          <Metric icon={<MessageSquare />} label="Events" value={data.counts.events} />
+        <div className="button-row">
+          <SecondaryButton onClick={() => downloadAdminFile("/api/export/participants", "participants.json", adminToken)} icon={<Download size={16} />}>Participants</SecondaryButton>
+          <SecondaryButton onClick={() => downloadAdminFile("/api/export/events", "events.jsonl", adminToken)} icon={<Download size={16} />}>Events</SecondaryButton>
+          <SecondaryButton onClick={() => downloadAdminFile("/api/export/analytics", "analytics.json", adminToken)} icon={<Download size={16} />}>Analytics</SecondaryButton>
+          <SecondaryButton onClick={() => downloadAdminFile("/api/export/participants.csv", "participants.csv", adminToken)} icon={<Download size={16} />}>Participants CSV</SecondaryButton>
+          <SecondaryButton onClick={() => downloadAdminFile("/api/export/events.csv", "events.csv", adminToken)} icon={<Download size={16} />}>Events CSV</SecondaryButton>
+          <SecondaryButton onClick={() => downloadAdminFile("/api/export/ratings.csv", "ratings.csv", adminToken)} icon={<Download size={16} />}>Ratings CSV</SecondaryButton>
         </div>
-        {data.counts.participants === 0 && <div className="empty-state">{t(lang, "emptyData")}</div>}
-        <div className="chart-grid">
-          <ChartPanel title={lang === "zh" ? "各条件样本量与校准行为" : "Condition N and Calibration"}>
-            <ResponsiveContainer width="100%" height={280}>
-              <BarChart data={conditionData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="condition" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Bar dataKey="n" fill="#1f77b4" />
-                <Bar dataKey="calibration" fill="#2a9d8f" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "角色人格主效应估计" : "Role Personality Main Effects"}>
-            <ResponsiveContainer width="100%" height={280}>
-              <BarChart data={mainEffectData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="role" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Bar dataKey="diff" fill="#6d5bd0" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "Seeded probes 决策分布" : "Seeded Probe Decisions"}>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={probeData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="probe" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Bar dataKey="accepted" stackId="a" fill="#2a9d8f" />
-                <Bar dataKey="rejected" stackId="a" fill="#c2410c" />
-                <Bar dataKey="questioned" stackId="a" fill="#f59e0b" />
-                <Bar dataKey="reframed" stackId="a" fill="#6d5bd0" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "盲评 improvement 趋势" : "Blind-rated Improvement by Condition"}>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={conditionData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="condition" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="improvement">
-                  {conditionData.map((_: unknown, index: number) => <Cell key={index} fill={index === 7 ? "#2a9d8f" : "#1f77b4"} />)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "Study 1 完成漏斗" : "Study 1 Completion Funnel"}>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={funnelData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="stage" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="count" fill="#2a9d8f" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "问卷构念均值" : "Survey Construct Means"}>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={constructData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="construct" />
-                <YAxis domain={[0, 7]} />
-                <Tooltip />
-                <Bar dataKey="mean" fill="#1f77b4" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "Agent 延迟与长度监控" : "Agent Latency and Length Monitor"}>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={agentRoleData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="role" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Bar dataKey="latency" fill="#6d5bd0" />
-                <Bar dataKey="tokens" fill="#f59e0b" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "用户定向询问对象" : "User-Directed Turn Targets"}>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={directedData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="target" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="count" fill="#c2410c" />
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "盲评覆盖率" : "Blind Rating Coverage"}>
-            <table className="quality-table">
-              <thead>
-                <tr>
-                  <th>Item</th>
-                  <th>Rated</th>
-                  <th>Needed</th>
+      </div>
+      <div className="metric-grid">
+        <Metric icon={<UserCheck />} label={lang === "zh" ? "参与者" : "Participants"} value={data.counts.participants} />
+        <Metric icon={<ClipboardCheck />} label={lang === "zh" ? "已完成" : "Completed"} value={data.counts.completed} />
+        <Metric icon={<Gauge />} label={lang === "zh" ? "盲评数" : "Blind ratings"} value={data.counts.ratings} />
+        <Metric icon={<ClipboardCheck />} label={lang === "zh" ? "已评满项" : "Fully rated items"} value={`${data.counts.fullyRatedBlindItems ?? 0}/${data.counts.expectedBlindItems ?? 0}`} />
+        <Metric icon={<MessageSquare />} label={lang === "zh" ? "事件" : "Events"} value={data.counts.events} />
+      </div>
+      {data.counts.participants === 0 && <div className="empty-state">{t(lang, "emptyData")}</div>}
+      <div className="chart-grid">
+        <ChartPanel title={lang === "zh" ? "配对均值：角色特定 vs 中性" : "Paired Means: Specific vs Neutral"}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={contrastData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="metric" interval={0} angle={-20} textAnchor="end" height={70} />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="neutral" fill="#1f77b4" name={lang === "zh" ? "中性团队" : "Neutral"} />
+              <Bar dataKey="specific" fill="#2a9d8f" name={lang === "zh" ? "角色特定团队" : "Specific"} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "配对效应量 (Cohen's dz)" : "Paired Effect Sizes (Cohen's dz)"}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={contrastData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="metric" interval={0} angle={-20} textAnchor="end" height={70} />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="dz" fill="#6d5bd0" />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "人格感知操控检查" : "Perceived-Personality Check"}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={perceivedData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="role" interval={0} angle={-15} textAnchor="end" height={70} />
+              <YAxis domain={[1, 7]} />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="neutral" fill="#1f77b4" name={lang === "zh" ? "中性" : "Neutral"} />
+              <Bar dataKey="specific" fill="#2a9d8f" name={lang === "zh" ? "角色特定" : "Specific"} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "Seeded probes 决策分布" : "Seeded Probe Decisions"}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={probeData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="probe" />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="accepted" stackId="a" fill="#2a9d8f" />
+              <Bar dataKey="rejected" stackId="a" fill="#c2410c" />
+              <Bar dataKey="questioned" stackId="a" fill="#f59e0b" />
+              <Bar dataKey="reframed" stackId="a" fill="#6d5bd0" />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "响应长度均等检查（按 arm）" : "Response-Length Parity (by arm)"}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={lengthData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="role" />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="neutral" fill="#1f77b4" name={lang === "zh" ? "中性" : "Neutral"} />
+              <Bar dataKey="specific" fill="#2a9d8f" name={lang === "zh" ? "角色特定" : "Specific"} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "完成漏斗" : "Completion Funnel"}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={funnelData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="stage" interval={0} angle={-15} textAnchor="end" height={70} />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="count" fill="#2a9d8f" />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "盲评覆盖率" : "Blind Rating Coverage"}>
+          <table className="quality-table">
+            <thead>
+              <tr><th>Item</th><th>Rated</th><th>Needed</th></tr>
+            </thead>
+            <tbody>
+              {coverageData.slice(0, 12).map((item: any) => (
+                <tr key={item.itemId}>
+                  <td>{item.displayId}</td>
+                  <td>{item.ratedCount}</td>
+                  <td>{item.neededRatings}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {coverageData.slice(0, 12).map((item: any) => (
-                  <tr key={item.itemId}>
-                    <td>{item.displayId}</td>
-                    <td>{item.ratedCount}</td>
-                    <td>{item.neededRatings}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {coverageData.length > 12 && <p className="muted">Showing 12 of {coverageData.length} items.</p>}
-          </ChartPanel>
-          <ChartPanel title={lang === "zh" ? "评分者一致性" : "Rater Reliability"}>
-            <table className="quality-table">
-              <thead>
-                <tr>
-                  <th>Dimension</th>
-                  <th>Alpha</th>
-                  <th>{"Items n>=2"}</th>
+              ))}
+            </tbody>
+          </table>
+          {coverageData.length > 12 && <p className="muted">Showing 12 of {coverageData.length} items.</p>}
+        </ChartPanel>
+        <ChartPanel title={lang === "zh" ? "评分者一致性" : "Rater Reliability"}>
+          <table className="quality-table">
+            <thead>
+              <tr><th>Dimension</th><th>Alpha</th><th>{"Items n>=2"}</th></tr>
+            </thead>
+            <tbody>
+              {reliabilityData.map((item: any) => (
+                <tr key={item.key}>
+                  <td>{item.label}</td>
+                  <td>{item.alpha === null ? "-" : item.alpha.toFixed(2)}</td>
+                  <td>{item.itemsWithTwoOrMoreRatings}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {reliabilityData.map((item: any) => (
-                  <tr key={item.key}>
-                    <td>{item.label}</td>
-                    <td>{item.alpha === null ? "-" : item.alpha.toFixed(2)}</td>
-                    <td>{item.itemsWithTwoOrMoreRatings}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </ChartPanel>
-        </div>
-      </section>
+              ))}
+            </tbody>
+          </table>
+        </ChartPanel>
+      </div>
+    </section>
   );
 }
 
@@ -1695,58 +1417,58 @@ function RaterPage({ lang, adminToken }: { lang: Language; adminToken: string })
   }
 
   return (
-      <section className="work-panel">
-        <div className="section-heading">
-          <div>
-            <p className="eyebrow">{t(lang, "rater")}</p>
-            <h2>{lang === "zh" ? "匿名单项盲评" : "Anonymous Single-Item Rating"}</h2>
-          </div>
-          <PrimaryButton onClick={submit} disabled={!selected} icon={<Save size={18} />}>{t(lang, "submit")}</PrimaryButton>
+    <section className="work-panel">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">{t(lang, "rater")}</p>
+          <h2>{lang === "zh" ? "匿名单项盲评" : "Anonymous Single-Item Rating"}</h2>
         </div>
-        <div className="rater-controls">
-          <label>
-            <span>Rater ID</span>
-            <input value={raterId} onChange={(event) => setRaterId(event.target.value)} />
-          </label>
-          <label>
-            <span>{lang === "zh" ? "匿名评分项" : "Anonymous item"}</span>
-            <select value={selected?.itemId ?? ""} onChange={(event) => setSelectedId(event.target.value)}>
-              {items.map((item) => (
-                <option key={item.itemId} value={item.itemId}>
-                  {item.displayId} · rated {item.ratedCount} · need {item.neededRatings}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        {error && <p className="error-text">{error}</p>}
-        {!selected && <div className="empty-state">{lang === "zh" ? "暂无可评分的 Study 1 方案。" : "No completed Study 1 proposals to rate yet."}</div>}
-        {selected && (
-          <div className="rater-grid rater-grid-single">
-            <ProposalReadOnly
-              lang={lang}
-              title={lang === "zh" ? "待评分方案" : "Proposal to Rate"}
-              task={lang === "zh" ? selected.topicZh : selected.topic}
-              proposal={selected.proposal}
-            />
-            <div className="rating-column">
-              <h3>{lang === "zh" ? "评分" : "Ratings"}</h3>
-              {raterDimensions.map((dimension) => (
-                <SliderField
-                  key={dimension.key}
-                  label={lang === "zh" ? dimension.labelZh : dimension.labelEn}
-                  value={ratings[dimension.key] ?? 4}
-                  onChange={(value) => setRatings({ ...ratings, [dimension.key]: value })}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-        <label className="text-field">
-          <span>{t(lang, "notes")}</span>
-          <textarea rows={5} value={notes} onChange={(event) => setNotes(event.target.value)} />
+        <PrimaryButton onClick={submit} disabled={!selected} icon={<Save size={18} />}>{t(lang, "submit")}</PrimaryButton>
+      </div>
+      <div className="rater-controls">
+        <label>
+          <span>Rater ID</span>
+          <input value={raterId} onChange={(event) => setRaterId(event.target.value)} />
         </label>
-      </section>
+        <label>
+          <span>{lang === "zh" ? "匿名评分项" : "Anonymous item"}</span>
+          <select value={selected?.itemId ?? ""} onChange={(event) => setSelectedId(event.target.value)}>
+            {items.map((item) => (
+              <option key={item.itemId} value={item.itemId}>
+                {item.displayId} · rated {item.ratedCount} · need {item.neededRatings}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {error && <p className="error-text">{error}</p>}
+      {!selected && <div className="empty-state">{lang === "zh" ? "暂无可评分的方案。" : "No completed proposals to rate yet."}</div>}
+      {selected && (
+        <div className="rater-grid rater-grid-single">
+          <ProposalReadOnly
+            lang={lang}
+            title={lang === "zh" ? "待评分方案" : "Proposal to Rate"}
+            task={lang === "zh" ? selected.topicZh : selected.topic}
+            proposal={selected.proposal}
+          />
+          <div className="rating-column">
+            <h3>{lang === "zh" ? "评分" : "Ratings"}</h3>
+            {raterDimensions.map((dimension) => (
+              <SliderField
+                key={dimension.key}
+                label={lang === "zh" ? dimension.labelZh : dimension.labelEn}
+                value={ratings[dimension.key] ?? 4}
+                onChange={(value) => setRatings({ ...ratings, [dimension.key]: value })}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      <label className="text-field">
+        <span>{t(lang, "notes")}</span>
+        <textarea rows={5} value={notes} onChange={(event) => setNotes(event.target.value)} />
+      </label>
+    </section>
   );
 }
 

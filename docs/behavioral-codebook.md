@@ -2,9 +2,9 @@
 
 ## Scope
 
-This codebook applies to Study 1 interaction logs, initial proposals, final proposals, seeded suggestion decisions, and optional probe decision notes.
+This codebook applies to the within-subjects study's interaction logs, initial proposals, final proposals, seeded-suggestion decisions, and optional probe decision notes. Every participant contributes **two blocks** (one neutral arm, one specific arm); code each block separately and label it with its arm so codes can be entered into the paired contrast. Coders do not need to be blind to the arm for process codes, but the proposal-quality codes (C12) reuse the blind rubric and must be coded without the arm or block label.
 
-Two human coders should independently code at least 25-30% of sessions. Resolve disagreements by discussion, revise the codebook, then code the remaining sessions. Report inter-rater reliability for each construct before adjudication.
+Two human coders should independently code at least 25-30% of blocks. Resolve disagreements by discussion, revise the codebook, then code the remaining blocks. Report inter-rater reliability for each construct before adjudication.
 
 ## Unit of Analysis
 
@@ -163,4 +163,8 @@ For proposal-level coding, score each dimension 1-7 using the blind rating rubri
 - evaluation rigor;
 - user agency.
 
-Coders should not use condition id while coding proposal quality.
+Coders should not use the arm or block label while coding proposal quality.
+
+## Using the codes in the paired analysis
+
+Because the design is within-subjects, the unit for the primary analysis is the **paired difference** between a participant's specific-arm block and neutral-arm block. For each construct above, compute the per-block score, then the per-participant (specific − neutral) difference, and feed those differences into the paired tests described in the pre-registration. Report process codes (C1–C11) as supporting evidence for RQ2 (experience and cost); use C5/C4 and the seeded-suggestion decisions for the RQ1 calibrated-reliance contrast.
